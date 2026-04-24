@@ -332,6 +332,29 @@ async def manual_check(_: None = Depends(_auth)) -> dict[str, Any]:
     return {"ok": True, "data": data}
 
 
+_REDACT_ENVS = (
+    "SYGEN_UPDATER_TOKEN",
+    "CLAUDE_CODE_OAUTH_TOKEN",
+    "ANTHROPIC_API_KEY",
+)
+
+
+def _redact(text: str) -> str:
+    """Scrub known-secret values from compose stdout/stderr before returning
+    to the admin UI. docker compose occasionally echoes the `--env-file`
+    values in error paths (e.g. "unset variable X") — if those contain
+    tokens, they'd leak to the browser. Replace each known secret value
+    with ``***`` so the output stays debuggable without exposing keys.
+    """
+    if not text:
+        return text
+    for env_name in _REDACT_ENVS:
+        value = os.environ.get(env_name, "")
+        if value and len(value) >= 8:
+            text = text.replace(value, "***")
+    return text
+
+
 async def _run_compose(args: list[str]) -> tuple[int, str, str]:
     """Run ``docker compose <args>`` and capture stdout/stderr.
 
@@ -415,8 +438,8 @@ async def apply_updates(_: None = Depends(_auth)) -> JSONResponse:
                     "ok": False,
                     "error": "docker compose pull failed",
                     "rc": pull_rc,
-                    "stdout": pull_out,
-                    "stderr": pull_err,
+                    "stdout": _redact(pull_out),
+                    "stderr": _redact(pull_err),
                 },
                 status_code=500,
             )
@@ -439,8 +462,8 @@ async def apply_updates(_: None = Depends(_auth)) -> JSONResponse:
                     "ok": False,
                     "error": "docker compose up failed",
                     "rc": up_rc,
-                    "stdout": up_out,
-                    "stderr": up_err,
+                    "stdout": _redact(up_out),
+                    "stderr": _redact(up_err),
                 },
                 status_code=500,
             )
@@ -457,8 +480,8 @@ async def apply_updates(_: None = Depends(_auth)) -> JSONResponse:
             {
                 "ok": True,
                 "restarted": services,
-                "pull": {"stdout": pull_out, "stderr": pull_err},
-                "up": {"stdout": up_out, "stderr": up_err},
+                "pull": {"stdout": _redact(pull_out), "stderr": _redact(pull_err)},
+                "up": {"stdout": _redact(up_out), "stderr": _redact(up_err)},
                 "state": state_after,
             }
         )

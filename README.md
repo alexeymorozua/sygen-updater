@@ -21,7 +21,7 @@ restarted mid-work.
      (`GET /containers/<name>/json` → `Image` → `/images/<id>/json` →
      `RepoDigests[0]`).
   3. Writes `{core, admin, checked_at}` to the shared state file
-     (`/state/updates.json` inside the container,
+     (`/state/_updates.json` inside the container,
      `/srv/sygen/data/_updates.json` on the host).
 - `GET /health` returns `{ok, last_check, last_error, check_interval}`
   without auth — safe to hit from a compose healthcheck.
@@ -42,7 +42,7 @@ restarted mid-work.
 | `CORE_CONTAINER` | `sygen-core` | Local container name (must match `container_name:` in compose). |
 | `ADMIN_CONTAINER` | `sygen-admin` | Local container name. |
 | `CHECK_INTERVAL` | `1800` | Poll interval in seconds. |
-| `STATE_PATH` | `/state/updates.json` | Where to write the state JSON (mounted through to core). |
+| `STATE_PATH` | `/state/_updates.json` | Where to write the state JSON (mounted through to core). |
 | `COMPOSE_FILE` | `/srv/sygen/docker-compose.yml` | Compose file used for apply. |
 | `COMPOSE_ENV_FILE` | `/srv/sygen/.env` | `--env-file` for apply. |
 | `DOCKER_SOCKET` | `/var/run/docker.sock` | Docker daemon socket (read/write). |
@@ -52,7 +52,7 @@ restarted mid-work.
 ```
 /var/run/docker.sock:/var/run/docker.sock       # read/write — apply needs it
 /srv/sygen:/srv/sygen                            # so docker compose can find the files
-/srv/sygen/data/_updates.json:/state/updates.json
+/srv/sygen/data:/state                           # core reads /data/_updates.json
 ```
 
 ## Standalone run (for local testing)

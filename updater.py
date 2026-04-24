@@ -40,7 +40,7 @@ logging.basicConfig(
 # ---------------------------------------------------------------------------
 
 CHECK_INTERVAL = int(os.environ.get("CHECK_INTERVAL", "1800"))
-STATE_PATH = Path(os.environ.get("STATE_PATH", "/state/updates.json"))
+STATE_PATH = Path(os.environ.get("STATE_PATH", "/state/_updates.json"))
 COMPOSE_FILE = os.environ.get("COMPOSE_FILE", "/srv/sygen/docker-compose.yml")
 COMPOSE_ENV_FILE = os.environ.get("COMPOSE_ENV_FILE", "/srv/sygen/.env")
 DOCKER_SOCKET = os.environ.get("DOCKER_SOCKET", "/var/run/docker.sock")

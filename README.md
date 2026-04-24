@@ -46,6 +46,7 @@ restarted mid-work.
 | `COMPOSE_FILE` | `/srv/sygen/docker-compose.yml` | Compose file used for apply. |
 | `COMPOSE_ENV_FILE` | `/srv/sygen/.env` | `--env-file` for apply. |
 | `DOCKER_SOCKET` | `/var/run/docker.sock` | Docker daemon socket (read/write). |
+| `COMPOSE_TIMEOUT` | `240` | Hard timeout (seconds) per `docker compose pull`/`up` invocation. On timeout, the subprocess is killed and `/apply` returns 504 `compose-timeout`; the apply lock is released so subsequent retries are not blocked. |
 
 ## Required mounts
 

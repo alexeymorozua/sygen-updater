@@ -74,6 +74,11 @@ _APPLY_MIN_INTERVAL = 60.0
 _last_apply_at: float = 0.0
 _apply_lock = asyncio.Lock()
 
+# Hard ceiling on how long a single ``docker compose`` invocation may run.
+# Pull of two images on a slow link is the worst case; 4 minutes is generous
+# without letting a wedged subprocess hold ``_apply_lock`` indefinitely.
+COMPOSE_TIMEOUT = float(os.environ.get("COMPOSE_TIMEOUT", "240"))
+
 app = FastAPI(title="sygen-updater", version="1.0.0")
 
 
@@ -288,12 +293,18 @@ def _auth(authorization: Optional[str] = Header(default=None)) -> None:
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="updater token not configured",
         )
-    if not authorization or not authorization.lower().startswith("bearer "):
+    if not authorization:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="missing bearer token",
         )
-    provided = authorization.split(" ", 1)[1].strip()
+    parts = authorization.split(" ", 1)
+    if len(parts) != 2 or parts[0].lower() != "bearer":
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="missing bearer token",
+        )
+    provided = parts[1].strip()
     # Constant-time compare.
     import hmac
 
@@ -322,7 +333,12 @@ async def manual_check(_: None = Depends(_auth)) -> dict[str, Any]:
 
 
 async def _run_compose(args: list[str]) -> tuple[int, str, str]:
-    """Run ``docker compose <args>`` and capture stdout/stderr."""
+    """Run ``docker compose <args>`` and capture stdout/stderr.
+
+    Raises ``asyncio.TimeoutError`` if the subprocess does not finish within
+    ``COMPOSE_TIMEOUT`` seconds. The process is killed and reaped before the
+    exception propagates so the caller never leaks a zombie.
+    """
     cmd = [
         "docker",
         "compose",
@@ -338,7 +354,21 @@ async def _run_compose(args: list[str]) -> tuple[int, str, str]:
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
     )
-    stdout_b, stderr_b = await proc.communicate()
+    try:
+        stdout_b, stderr_b = await asyncio.wait_for(
+            proc.communicate(), timeout=COMPOSE_TIMEOUT
+        )
+    except asyncio.TimeoutError:
+        logger.error("compose %s exceeded %ss; killing subprocess", args, COMPOSE_TIMEOUT)
+        try:
+            proc.kill()
+        except ProcessLookupError:
+            pass
+        try:
+            await proc.wait()
+        except Exception:  # pragma: no cover — best-effort reap
+            pass
+        raise
     return proc.returncode or 0, stdout_b.decode(errors="replace"), stderr_b.decode(errors="replace")
 
 
@@ -352,6 +382,8 @@ async def apply_updates(_: None = Depends(_auth)) -> JSONResponse:
     """
     global _last_apply_at
 
+    # ``async with`` already releases the lock on any exception, so a
+    # compose timeout cannot wedge subsequent /apply calls.
     async with _apply_lock:
         now = asyncio.get_event_loop().time()
         if now - _last_apply_at < _APPLY_MIN_INTERVAL:
@@ -365,7 +397,18 @@ async def apply_updates(_: None = Depends(_auth)) -> JSONResponse:
 
         services = list(APPLY_SERVICES)
 
-        pull_rc, pull_out, pull_err = await _run_compose(["pull", *services])
+        try:
+            pull_rc, pull_out, pull_err = await _run_compose(["pull", *services])
+        except asyncio.TimeoutError:
+            return JSONResponse(
+                {
+                    "ok": False,
+                    "error": "compose-timeout",
+                    "stage": "pull",
+                    "timeout_seconds": COMPOSE_TIMEOUT,
+                },
+                status_code=504,
+            )
         if pull_rc != 0:
             return JSONResponse(
                 {
@@ -378,7 +421,18 @@ async def apply_updates(_: None = Depends(_auth)) -> JSONResponse:
                 status_code=500,
             )
 
-        up_rc, up_out, up_err = await _run_compose(["up", "-d", *services])
+        try:
+            up_rc, up_out, up_err = await _run_compose(["up", "-d", *services])
+        except asyncio.TimeoutError:
+            return JSONResponse(
+                {
+                    "ok": False,
+                    "error": "compose-timeout",
+                    "stage": "up",
+                    "timeout_seconds": COMPOSE_TIMEOUT,
+                },
+                status_code=504,
+            )
         if up_rc != 0:
             return JSONResponse(
                 {

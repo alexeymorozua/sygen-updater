@@ -59,7 +59,10 @@ jobs:
         with:
           context: .
           file: ./Dockerfile
-          platforms: linux/amd64
+          # Multi-arch so :latest works on Apple Silicon (colima default)
+          # and amd64 VPS hosts. arm64 emulates via QEMU on the GH amd64
+          # runner — slower first build, cached after.
+          platforms: linux/amd64,linux/arm64
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}

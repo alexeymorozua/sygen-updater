@@ -16,13 +16,20 @@ restarted mid-work.
 
 - Every `CHECK_INTERVAL` seconds the sidecar:
   1. Resolves the current remote digest from GHCR's v2 manifest API
-     (anonymous bearer token, public repos only).
-  2. Reads the local digest from the docker daemon via the UNIX socket
-     (`GET /containers/<name>/json` → `Image` → `/images/<id>/json` →
-     `RepoDigests[0]`).
+     (anonymous bearer token, public repos only) and reads the
+     `org.opencontainers.image.version` label from the matching image
+     config blob (`latest_version` semver — populated by
+     `docker/metadata-action@v5` in our CI).
+  2. Reads the local digest and version label from the docker daemon
+     via the UNIX socket (`GET /containers/<name>/json` →
+     `Image` → `/images/<id>/json` → `RepoDigests[0]` and
+     `Config.Labels`).
   3. Writes `{core, admin, checked_at}` to the shared state file
      (`/state/_updates.json` inside the container,
-     `/srv/sygen/data/_updates.json` on the host).
+     `/srv/sygen/data/_updates.json` on the host). Each component
+     entry carries `current`/`latest` (digests) and `version`/`latest_version`
+     (semver) — clients prefer the semver and fall back to short digests
+     when the label is missing.
 - `GET /health` returns `{ok, last_check, last_error, check_interval}`
   without auth — safe to hit from a compose healthcheck.
 - `POST /apply` requires `Authorization: Bearer $SYGEN_UPDATER_TOKEN`.

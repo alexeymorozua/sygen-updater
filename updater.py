@@ -191,6 +191,148 @@ async def fetch_local_digest(client: httpx.AsyncClient, container: str) -> Optio
         return None
 
 
+async def fetch_local_version(client: httpx.AsyncClient, container: str) -> Optional[str]:
+    """Read ``org.opencontainers.image.version`` from the running container's
+    image labels, or ``None`` if the label is missing / image not inspectable.
+
+    Both core and admin CI flows tag images via ``docker/metadata-action@v5``,
+    which sets this label automatically from the git tag (``v1.6.62`` →
+    label ``1.6.62``). Self-built images without the label still work — we
+    just return ``None`` and the consumer falls back to the digest.
+    """
+    try:
+        r = await client.get(f"http://localhost/containers/{container}/json", timeout=10.0)
+        if r.status_code == 404:
+            return None
+        r.raise_for_status()
+        image_id = r.json().get("Image")
+        if not image_id:
+            return None
+        ri = await client.get(f"http://localhost/images/{image_id}/json", timeout=10.0)
+        if ri.status_code == 404:
+            return None
+        ri.raise_for_status()
+        labels = ((ri.json().get("Config") or {}).get("Labels")) or {}
+        version = labels.get("org.opencontainers.image.version")
+        if isinstance(version, str) and version:
+            return version
+        return None
+    except httpx.HTTPError as exc:
+        logger.warning("local version lookup failed for %s: %s", container, exc)
+        return None
+
+
+async def fetch_remote_version(client: httpx.AsyncClient, image: str) -> Optional[str]:
+    """Read ``org.opencontainers.image.version`` from the registry's latest
+    image config blob. Two hops: manifest → config-blob digest → blob JSON
+    where the labels live.
+
+    Multi-arch images (the GHCR default for ``docker/build-push-action`` with
+    ``platforms: linux/amd64,linux/arm64``) serve a manifest *index*. We
+    pick the linux/amd64 child manifest if present, otherwise the first
+    entry — labels are identical across platforms in our build pipeline,
+    so the choice doesn't affect the returned value.
+    """
+    repo, reference = _parse_image(image)
+    token = await _ghcr_token(client, repo)
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Accept": (
+            "application/vnd.oci.image.index.v1+json,"
+            "application/vnd.oci.image.manifest.v1+json,"
+            "application/vnd.docker.distribution.manifest.list.v2+json,"
+            "application/vnd.docker.distribution.manifest.v2+json"
+        ),
+    }
+    try:
+        r = await client.get(
+            f"https://ghcr.io/v2/{repo}/manifests/{reference}",
+            headers=headers,
+            timeout=15.0,
+        )
+        r.raise_for_status()
+        manifest = r.json()
+        media = (
+            (manifest.get("mediaType") if isinstance(manifest, dict) else None)
+            or r.headers.get("Content-Type", "")
+        )
+
+        # If it's an index/list, descend into a single-arch manifest.
+        if "manifest.list" in media or "image.index" in media:
+            manifests = manifest.get("manifests") or []
+            picked = None
+            for m in manifests:
+                platform = m.get("platform") or {}
+                if (
+                    platform.get("architecture") == "amd64"
+                    and platform.get("os") == "linux"
+                ):
+                    picked = m
+                    break
+            if picked is None and manifests:
+                # Fall back to the first non-attestation manifest; attestation
+                # entries advertise an ``unknown/unknown`` platform.
+                for m in manifests:
+                    platform = m.get("platform") or {}
+                    if platform.get("architecture") != "unknown":
+                        picked = m
+                        break
+            if not picked:
+                return None
+            child_digest = picked.get("digest")
+            if not child_digest:
+                return None
+            r = await client.get(
+                f"https://ghcr.io/v2/{repo}/manifests/{child_digest}",
+                headers=headers,
+                timeout=15.0,
+            )
+            r.raise_for_status()
+            manifest = r.json()
+
+        config_descriptor = manifest.get("config") if isinstance(manifest, dict) else None
+        config_digest = (
+            config_descriptor.get("digest") if isinstance(config_descriptor, dict) else None
+        )
+        if not config_digest:
+            return None
+
+        # Config blob is a small JSON document; just fetch it. ``Authorization``
+        # is still required (GHCR's blob endpoints use the same anon-pull
+        # token), but the manifest media types are not.
+        #
+        # ``follow_redirects=True`` is essential here: GHCR serves blobs
+        # via a 307 redirect to ``pkg-containers.githubusercontent.com``,
+        # the shared httpx client at the call site has the default
+        # ``follow_redirects=False``, so without this kwarg ``rc`` would
+        # come back as a 307 with an HTML body, ``raise_for_status`` would
+        # not fire (3xx is not an error), and ``rc.json()`` would explode —
+        # making this whole function silently return None on every call.
+        rc = await client.get(
+            f"https://ghcr.io/v2/{repo}/blobs/{config_digest}",
+            headers={"Authorization": f"Bearer {token}"},
+            timeout=15.0,
+            follow_redirects=True,
+        )
+        rc.raise_for_status()
+        blob = rc.json()
+        # OCI image config has labels under ``config.Labels``; some older
+        # docker schema variants nest them under top-level ``Labels``. Cover
+        # both paths.
+        labels = (
+            ((blob.get("config") if isinstance(blob, dict) else None) or {}).get("Labels")
+            or (blob.get("Labels") if isinstance(blob, dict) else None)
+            or {}
+        )
+        version = labels.get("org.opencontainers.image.version")
+        if isinstance(version, str) and version:
+            return version
+        return None
+    except (httpx.HTTPError, RuntimeError, ValueError) as exc:
+        logger.warning("remote version lookup failed for %s: %s", image, exc)
+        return None
+
+
 # ---------------------------------------------------------------------------
 # State file
 # ---------------------------------------------------------------------------
@@ -236,6 +378,12 @@ async def run_check() -> dict[str, Any]:
                 "update_available": False,
                 "checked_at": now,
                 "error": None,
+                # Semver siblings of ``current``/``latest`` for the mobile +
+                # admin About-section / update banner subtitle. ``null`` when
+                # the image lacks the ``org.opencontainers.image.version``
+                # OCI label or the registry hop fails.
+                "version": None,
+                "latest_version": None,
             }
             try:
                 entry["latest"] = await fetch_remote_digest(registry_client, image)
@@ -244,6 +392,8 @@ async def run_check() -> dict[str, Any]:
                 logger.warning("%s: remote digest failed: %s", key, exc)
 
             entry["current"] = await fetch_local_digest(docker_client, container)
+            entry["version"] = await fetch_local_version(docker_client, container)
+            entry["latest_version"] = await fetch_remote_version(registry_client, image)
 
             if entry["current"] and entry["latest"]:
                 entry["update_available"] = entry["current"] != entry["latest"]

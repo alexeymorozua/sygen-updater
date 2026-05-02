@@ -87,7 +87,14 @@ def _resolve_sygen_home() -> Path:
 
 
 SYGEN_HOME = _resolve_sygen_home()
+# install.sh writes .install_manifest.json into SYGEN_ROOT (one level above
+# SYGEN_HOME on real installs: /srv/sygen/.install_manifest.json with
+# SYGEN_HOME=/srv/sygen/data). Fall back to SYGEN_HOME.parent when SYGEN_ROOT
+# is unset — wrong on macOS dev (~/.sygen-local), but the manifest doesn't
+# exist there so _update_install_manifest silent no-ops.
+SYGEN_ROOT = Path(os.environ.get("SYGEN_ROOT") or str(SYGEN_HOME.parent))
 ENV_FILE = SYGEN_HOME / ".env"
+INSTALL_MANIFEST = SYGEN_ROOT / ".install_manifest.json"
 STATE_PATH = Path(
     os.environ.get("STATE_PATH", str(SYGEN_HOME / "host_updates" / "_updates.json"))
 )
@@ -571,6 +578,30 @@ def _update_env_pin(key: str, value: str) -> None:
     os.replace(tmp, ENV_FILE)
 
 
+def _update_install_manifest(key: str, value: str) -> None:
+    """Update a single field in $SYGEN_ROOT/.install_manifest.json.
+
+    Atomic write via tmp + os.replace. Silent no-op if the manifest is
+    missing (legacy installs predating the manifest), unreadable, or
+    not a JSON object — we never create it from scratch since install.sh
+    is the source of truth for the rest of its fields.
+    """
+    if not INSTALL_MANIFEST.exists():
+        return
+    try:
+        data = json.loads(INSTALL_MANIFEST.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return
+    if not isinstance(data, dict):
+        return
+    if data.get(key) == value:
+        return
+    data[key] = value
+    tmp = INSTALL_MANIFEST.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+    os.replace(tmp, INSTALL_MANIFEST)
+
+
 _PYTHON_SHEBANG_RE = re.compile(rb"^#!(\S+/python\d*(?:\.\d+)?)")
 
 
@@ -743,6 +774,12 @@ def _apply_core(version: str) -> None:
             if renamed_away and venv_prev.exists():
                 venv_prev.rename(VENV_DIR)
             raise
+        # P0 (1.6.79): persist the new version BEFORE start_service so /check
+        # reflects the swap on the very next poll. Done inside the try-block
+        # so a rolled-back swap (rename or shebang-rewrite failure) leaves
+        # the pins on the previous version.
+        _update_env_pin("SYGEN_CORE_VERSION", version)
+        _update_install_manifest("core_version", version)
     finally:
         _start_service(core_label)
     shutil.rmtree(wheel_path.parent, ignore_errors=True)
@@ -791,6 +828,11 @@ def _apply_admin(version: str) -> None:
             if renamed_away and admin_prev.exists():
                 admin_prev.rename(ADMIN_DIR)
             raise
+        # P0 (1.6.79): persist the new version BEFORE start_service so /check
+        # reflects the swap on the very next poll. Done inside the try-block
+        # so a failed rename leaves the pins on the previous version.
+        _update_env_pin("SYGEN_ADMIN_VERSION", version)
+        _update_install_manifest("admin_version", version)
     finally:
         _start_service(admin_label)
     shutil.rmtree(tmp_root, ignore_errors=True)
@@ -951,11 +993,13 @@ async def _handle_apply(headers: dict[str, str]) -> bytes:
         try:
             if core_latest != core_current:
                 logger.info("applying core %s → %s", core_current, core_latest)
+                # _apply_core writes the new version pin to .env +
+                # .install_manifest.json itself (1.6.79) once the swap is
+                # past the rollback window — no second pin update here.
                 await asyncio.wait_for(
                     loop.run_in_executor(None, _apply_core, core_latest),
                     timeout=APPLY_TIMEOUT,
                 )
-                _update_env_pin("SYGEN_CORE_VERSION", core_latest)
                 applied.append(f"core {core_current} → {core_latest}")
 
             if admin_latest != admin_current:
@@ -964,7 +1008,6 @@ async def _handle_apply(headers: dict[str, str]) -> bytes:
                     loop.run_in_executor(None, _apply_admin, admin_latest),
                     timeout=APPLY_TIMEOUT,
                 )
-                _update_env_pin("SYGEN_ADMIN_VERSION", admin_latest)
                 applied.append(f"admin {admin_current} → {admin_latest}")
         except asyncio.TimeoutError:
             return _http_response(

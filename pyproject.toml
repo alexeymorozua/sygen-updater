@@ -1,0 +1,27 @@
+[build-system]
+requires = ["hatchling>=1.28.0"]
+build-backend = "hatchling.build"
+
+[project]
+name = "sygen-updater"
+version = "1.6.74"
+description = "Sygen native updater — polls GitHub Releases, atomically swaps venv + admin tarball, restarts services."
+readme = "README.md"
+requires-python = ">=3.11"
+license = "LicenseRef-BSL-1.1"
+authors = [{ name = "TIME DESIGN LLC" }]
+
+# Pure stdlib runtime — keeps the venv tiny and the updater independent
+# of the core's dependency churn (so a bad core release can't lock the
+# updater out of swapping it back).
+dependencies = []
+
+[project.scripts]
+sygen-updater = "updater:entrypoint"
+
+[tool.hatch.build.targets.wheel]
+packages = []
+include = ["updater.py"]
+
+[tool.hatch.build.targets.sdist]
+include = ["updater.py", "README.md", "pyproject.toml"]

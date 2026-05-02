@@ -1,33 +1,55 @@
-"""Sygen updater sidecar.
+"""Sygen updater (native install).
 
-Runs inside the compose stack on the shared docker network. Responsibilities:
+Polls GitHub Releases for new sygen / sygen-admin tags and exposes a
+local HTTP endpoint that core's /apply flow calls to swap in a new
+venv + admin tarball atomically.
 
-1. Every ``CHECK_INTERVAL`` seconds, query GHCR for the current remote digest
-   of the core and admin images and compare it to whatever digest is
-   currently running on the local docker daemon. Write the result atomically
-   to ``/state/updates.json`` — core reads it back via ``/api/system/updates``.
-2. Expose ``GET /health`` (unauthenticated — used by compose healthchecks).
-3. Expose ``POST /apply`` (bearer-auth via ``SYGEN_UPDATER_TOKEN``). When
-   called, runs ``docker compose pull && docker compose up -d`` scoped to
-   the ``core`` and ``admin`` services. The updater itself and watchtower
-   are deliberately excluded — the operator redeploys those out-of-band so
-   an apply never kills the apply request mid-flight.
+Architecture:
+
+1. Every ``CHECK_INTERVAL`` seconds, GET the GitHub Releases API for the
+   ``alexeymorozua/sygen`` and ``alexeymorozua/sygen-admin`` repos, take
+   the latest release's ``tag_name`` (e.g. ``v1.6.75``), strip the
+   leading ``v`` to get the version. Compare to the version pinned in
+   ``$SYGEN_HOME/.env`` (``SYGEN_CORE_VERSION`` /
+   ``SYGEN_ADMIN_VERSION``). Write the result atomically to
+   ``$SYGEN_HOME/host_updates/_updates.json`` — core reads it back via
+   ``GET /api/system/updates``.
+
+2. Expose ``GET /health`` (unauthenticated, used by smoke tests).
+
+3. Expose ``POST /apply`` (bearer-auth via ``SYGEN_UPDATER_TOKEN``).
+   When called:
+     - download the new wheel from the GitHub Release
+     - create a new venv at ``$VENV_NEW_DIR`` and ``pip install`` the wheel
+     - mv-swap: ``venv → venv-prev``, ``venv-new → venv``
+     - download the admin tarball, extract to ``$ADMIN_NEW_DIR``
+     - mv-swap: ``admin → admin-prev``, ``admin-new → admin``
+     - update ``.env`` with the new version pins
+     - kick the core + admin services (launchctl on macOS, systemctl on
+       Linux) so the new code is running
+
+The updater itself is NOT swapped during an apply — that would kill the
+in-flight request. ``sygen-updater`` ships from the same wheel as
+``sygen-core``, so a manual ``pip install --upgrade sygen-updater`` is
+the path to update the updater. (Or: a fresh re-run of install.sh.)
 """
 
 from __future__ import annotations
 
 import asyncio
 import datetime as dt
+import hmac
 import json
 import logging
 import os
+import platform
+import shutil
+import subprocess
 import tempfile
+import urllib.error
+import urllib.request
 from pathlib import Path
-from typing import Any, Dict, Optional
-
-import httpx
-from fastapi import Depends, FastAPI, Header, HTTPException, status
-from fastapi.responses import JSONResponse
+from typing import Any, Optional
 
 logger = logging.getLogger("sygen-updater")
 logging.basicConfig(
@@ -35,311 +57,120 @@ logging.basicConfig(
     format="%(asctime)s %(levelname)s %(name)s: %(message)s",
 )
 
+
 # ---------------------------------------------------------------------------
-# Config
+# Config (resolved from .env at startup)
 # ---------------------------------------------------------------------------
 
+
+def _resolve_sygen_home() -> Path:
+    h = os.environ.get("SYGEN_HOME") or os.environ.get("SYGEN_ROOT")
+    if h:
+        return Path(h)
+    # Fallback heuristics for ad-hoc invocations.
+    if platform.system() == "Darwin":
+        return Path.home() / ".sygen-local"
+    return Path("/srv/sygen")
+
+
+SYGEN_HOME = _resolve_sygen_home()
+ENV_FILE = SYGEN_HOME / ".env"
+STATE_PATH = Path(
+    os.environ.get("STATE_PATH", str(SYGEN_HOME / "host_updates" / "_updates.json"))
+)
+VENV_DIR = Path(os.environ.get("SYGEN_VENV_DIR", str(SYGEN_HOME / "venv")))
+ADMIN_DIR = Path(os.environ.get("SYGEN_ADMIN_DIR", str(SYGEN_HOME / "admin")))
+LISTEN_HOST = os.environ.get("SYGEN_UPDATER_HOST", "127.0.0.1")
+LISTEN_PORT = int(os.environ.get("SYGEN_UPDATER_PORT", "8082"))
 CHECK_INTERVAL = int(os.environ.get("CHECK_INTERVAL", "1800"))
-STATE_PATH = Path(os.environ.get("STATE_PATH", "/state/_updates.json"))
-COMPOSE_FILE = os.environ.get("COMPOSE_FILE", "/srv/sygen/docker-compose.yml")
-COMPOSE_ENV_FILE = os.environ.get("COMPOSE_ENV_FILE", "/srv/sygen/.env")
-DOCKER_SOCKET = os.environ.get("DOCKER_SOCKET", "/var/run/docker.sock")
-UPDATER_TOKEN = os.environ.get("SYGEN_UPDATER_TOKEN", "")
+APPLY_TIMEOUT = float(os.environ.get("SYGEN_APPLY_TIMEOUT", "600"))
 
-# Image references. These are the *full* image strings used in compose
-# (``ghcr.io/owner/repo:tag``). We need tag + repo for manifest lookup, so we
-# parse them lazily.
-CORE_IMAGE = os.environ.get("CORE_IMAGE", "ghcr.io/alexeymorozua/sygen-core:latest")
-ADMIN_IMAGE = os.environ.get("ADMIN_IMAGE", "ghcr.io/alexeymorozua/sygen-admin:latest")
 
-# Container names we query for the currently-running digest. Must match
-# the ``container_name:`` fields in the compose file.
-CORE_CONTAINER = os.environ.get("CORE_CONTAINER", "sygen-core")
-ADMIN_CONTAINER = os.environ.get("ADMIN_CONTAINER", "sygen-admin")
+def _load_env_file(path: Path) -> dict[str, str]:
+    """Cheap .env reader. KEY=value lines, ignoring blanks + comments."""
+    out: dict[str, str] = {}
+    if not path.is_file():
+        return out
+    try:
+        for line in path.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            k, v = line.split("=", 1)
+            out[k.strip()] = v.strip().strip('"').strip("'")
+    except OSError as exc:
+        logger.warning("read %s: %s", path, exc)
+    return out
 
-# Compose services that ``apply`` is allowed to restart. The updater
-# itself and watchtower are NOT in this list on purpose (see module
-# docstring).
-APPLY_SERVICES = ("core", "admin")
 
-# Track last successful check for /health diagnostics.
-_last_check: Optional[str] = None
-_last_error: Optional[str] = None
+def _config() -> dict[str, str]:
+    """Combine .env file values with process env (process env wins)."""
+    cfg = _load_env_file(ENV_FILE)
+    for k in (
+        "SYGEN_CORE_VERSION",
+        "SYGEN_ADMIN_VERSION",
+        "SYGEN_UPDATER_TOKEN",
+        "SYGEN_CORE_GITHUB_REPO",
+        "SYGEN_ADMIN_GITHUB_REPO",
+    ):
+        v = os.environ.get(k)
+        if v:
+            cfg[k] = v
+    return cfg
 
-# Per-user rate limit for /apply. The spec says "1 per minute per user",
-# but the updater does not know the user — it only sees the bearer token.
-# Enforce a global 1-per-60s instead; core already hops through JWT/admin
-# checks before proxying, so this is belt-and-braces.
+
+# Per-process apply lock + rate limit. The /apply call is destructive and
+# expensive, so reject overlapping requests outright.
 _APPLY_MIN_INTERVAL = 60.0
-_last_apply_at: float = 0.0
 _apply_lock = asyncio.Lock()
-
-# Hard ceiling on how long a single ``docker compose`` invocation may run.
-# Pull of two images on a slow link is the worst case; 4 minutes is generous
-# without letting a wedged subprocess hold ``_apply_lock`` indefinitely.
-COMPOSE_TIMEOUT = float(os.environ.get("COMPOSE_TIMEOUT", "240"))
-
-app = FastAPI(title="sygen-updater", version="1.0.0")
+_last_apply_at = 0.0
+_last_check_at: Optional[str] = None
+_last_check_error: Optional[str] = None
 
 
 # ---------------------------------------------------------------------------
-# GHCR manifest + local digest probing
+# GitHub Releases API
 # ---------------------------------------------------------------------------
 
 
-def _parse_image(image: str) -> tuple[str, str]:
-    """Split ``ghcr.io/owner/repo:tag`` into (``owner/repo``, ``tag``).
+def _http_get_json(url: str, timeout: float = 15.0) -> Any:
+    """Plain stdlib HTTP GET → JSON. No external deps in the venv."""
+    req = urllib.request.Request(
+        url,
+        headers={
+            "Accept": "application/vnd.github+json",
+            "User-Agent": "sygen-updater",
+            # Inherit GH_TOKEN if set (rate-limit relief on private testing).
+            **(
+                {"Authorization": f"Bearer {os.environ['GH_TOKEN']}"}
+                if os.environ.get("GH_TOKEN")
+                else {}
+            ),
+        },
+    )
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return json.load(resp)
 
-    Digest pins (``@sha256:...``) are passed through as the "tag".
-    Defaults to ``latest`` if no tag is given.
+
+def fetch_latest_version(repo: str) -> Optional[str]:
+    """Return the latest released tag of ``repo`` (e.g. "1.6.74"), or None.
+
+    Strips the leading ``v`` so the returned string is comparable to the
+    semver values pinned in .env.
     """
-    if image.startswith("ghcr.io/"):
-        image = image[len("ghcr.io/") :]
-    if "@" in image:
-        repo, digest = image.split("@", 1)
-        return repo, digest
-    if ":" in image:
-        repo, tag = image.rsplit(":", 1)
-        return repo, tag
-    return image, "latest"
-
-
-async def _ghcr_token(client: httpx.AsyncClient, repo: str) -> str:
-    """Fetch a short-lived pull token from GHCR's anonymous token endpoint.
-
-    Public repos accept this without credentials. Private repos would need a
-    PAT — not supported here since the installer only uses public images.
-    """
-    url = "https://ghcr.io/token"
-    params = {"service": "ghcr.io", "scope": f"repository:{repo}:pull"}
-    r = await client.get(url, params=params, timeout=15.0)
-    r.raise_for_status()
-    data = r.json()
-    tok = data.get("token") or data.get("access_token") or ""
-    if not tok:
-        raise RuntimeError(f"no token from ghcr for {repo}")
-    return tok
-
-
-async def fetch_remote_digest(client: httpx.AsyncClient, image: str) -> str:
-    """Resolve ``image`` to the current remote digest via GHCR's v2 API.
-
-    The ``Docker-Content-Digest`` response header is the manifest digest,
-    which matches what ``docker pull`` would record as ``RepoDigests[0]``.
-    """
-    repo, reference = _parse_image(image)
-    token = await _ghcr_token(client, repo)
-    url = f"https://ghcr.io/v2/{repo}/manifests/{reference}"
-    headers = {
-        "Authorization": f"Bearer {token}",
-        # Accept OCI + legacy docker manifest formats. GHCR serves an OCI
-        # index for multi-platform images; the digest header is identical
-        # across types.
-        "Accept": (
-            "application/vnd.oci.image.index.v1+json,"
-            "application/vnd.oci.image.manifest.v1+json,"
-            "application/vnd.docker.distribution.manifest.list.v2+json,"
-            "application/vnd.docker.distribution.manifest.v2+json"
-        ),
-    }
-    # HEAD is enough — we only need the digest header.
-    r = await client.head(url, headers=headers, timeout=15.0)
-    # Some registries return 405 on HEAD for certain media types; fall back
-    # to GET.
-    if r.status_code == 405:
-        r = await client.get(url, headers=headers, timeout=30.0)
-    r.raise_for_status()
-    digest = r.headers.get("Docker-Content-Digest") or r.headers.get("docker-content-digest")
-    if not digest:
-        raise RuntimeError(f"no Docker-Content-Digest header for {image}")
-    return digest
-
-
-def _docker_transport() -> httpx.AsyncHTTPTransport:
-    """httpx transport that speaks HTTP over the docker UNIX socket."""
-    return httpx.AsyncHTTPTransport(uds=DOCKER_SOCKET)
-
-
-async def fetch_local_digest(client: httpx.AsyncClient, container: str) -> Optional[str]:
-    """Return the ``RepoDigests[0]`` sha256 of the image currently running in
-    ``container``, or ``None`` if the container or image cannot be inspected.
-
-    Uses the docker daemon HTTP API over the mounted UNIX socket.
-    """
+    url = f"https://api.github.com/repos/{repo}/releases/latest"
     try:
-        r = await client.get(f"http://localhost/containers/{container}/json", timeout=10.0)
-        if r.status_code == 404:
-            return None
-        r.raise_for_status()
-        image_id = r.json().get("Image")
-        if not image_id:
-            return None
-        ri = await client.get(f"http://localhost/images/{image_id}/json", timeout=10.0)
-        if ri.status_code == 404:
-            return None
-        ri.raise_for_status()
-        repo_digests = ri.json().get("RepoDigests") or []
-        if not repo_digests:
-            return None
-        # RepoDigests entries look like "ghcr.io/foo/bar@sha256:...".
-        first = repo_digests[0]
-        if "@" in first:
-            return first.split("@", 1)[1]
-        return first
-    except httpx.HTTPError as exc:
-        logger.warning("local digest lookup failed for %s: %s", container, exc)
+        data = _http_get_json(url)
+    except (urllib.error.HTTPError, urllib.error.URLError, ValueError, OSError) as exc:
+        logger.warning("GitHub Releases API error for %s: %s", repo, exc)
         return None
-
-
-async def fetch_local_version(client: httpx.AsyncClient, container: str) -> Optional[str]:
-    """Read ``org.opencontainers.image.version`` from the running container's
-    image labels, or ``None`` if the label is missing / image not inspectable.
-
-    Both core and admin CI flows tag images via ``docker/metadata-action@v5``,
-    which sets this label automatically from the git tag (``v1.6.62`` →
-    label ``1.6.62``). Self-built images without the label still work — we
-    just return ``None`` and the consumer falls back to the digest.
-    """
-    try:
-        r = await client.get(f"http://localhost/containers/{container}/json", timeout=10.0)
-        if r.status_code == 404:
-            return None
-        r.raise_for_status()
-        image_id = r.json().get("Image")
-        if not image_id:
-            return None
-        ri = await client.get(f"http://localhost/images/{image_id}/json", timeout=10.0)
-        if ri.status_code == 404:
-            return None
-        ri.raise_for_status()
-        labels = ((ri.json().get("Config") or {}).get("Labels")) or {}
-        version = labels.get("org.opencontainers.image.version")
-        if isinstance(version, str) and version:
-            return version
+    tag = data.get("tag_name") if isinstance(data, dict) else None
+    if not isinstance(tag, str):
         return None
-    except httpx.HTTPError as exc:
-        logger.warning("local version lookup failed for %s: %s", container, exc)
-        return None
-
-
-async def fetch_remote_version(client: httpx.AsyncClient, image: str) -> Optional[str]:
-    """Read ``org.opencontainers.image.version`` from the registry's latest
-    image config blob. Two hops: manifest → config-blob digest → blob JSON
-    where the labels live.
-
-    Multi-arch images (the GHCR default for ``docker/build-push-action`` with
-    ``platforms: linux/amd64,linux/arm64``) serve a manifest *index*. We
-    pick the linux/amd64 child manifest if present, otherwise the first
-    entry — labels are identical across platforms in our build pipeline,
-    so the choice doesn't affect the returned value.
-    """
-    repo, reference = _parse_image(image)
-    token = await _ghcr_token(client, repo)
-    headers = {
-        "Authorization": f"Bearer {token}",
-        "Accept": (
-            "application/vnd.oci.image.index.v1+json,"
-            "application/vnd.oci.image.manifest.v1+json,"
-            "application/vnd.docker.distribution.manifest.list.v2+json,"
-            "application/vnd.docker.distribution.manifest.v2+json"
-        ),
-    }
-    try:
-        r = await client.get(
-            f"https://ghcr.io/v2/{repo}/manifests/{reference}",
-            headers=headers,
-            timeout=15.0,
-        )
-        r.raise_for_status()
-        manifest = r.json()
-        media = (
-            (manifest.get("mediaType") if isinstance(manifest, dict) else None)
-            or r.headers.get("Content-Type", "")
-        )
-
-        # If it's an index/list, descend into a single-arch manifest.
-        if "manifest.list" in media or "image.index" in media:
-            manifests = manifest.get("manifests") or []
-            picked = None
-            for m in manifests:
-                platform = m.get("platform") or {}
-                if (
-                    platform.get("architecture") == "amd64"
-                    and platform.get("os") == "linux"
-                ):
-                    picked = m
-                    break
-            if picked is None and manifests:
-                # Fall back to the first non-attestation manifest; attestation
-                # entries advertise an ``unknown/unknown`` platform.
-                for m in manifests:
-                    platform = m.get("platform") or {}
-                    if platform.get("architecture") != "unknown":
-                        picked = m
-                        break
-            if not picked:
-                return None
-            child_digest = picked.get("digest")
-            if not child_digest:
-                return None
-            r = await client.get(
-                f"https://ghcr.io/v2/{repo}/manifests/{child_digest}",
-                headers=headers,
-                timeout=15.0,
-            )
-            r.raise_for_status()
-            manifest = r.json()
-
-        config_descriptor = manifest.get("config") if isinstance(manifest, dict) else None
-        config_digest = (
-            config_descriptor.get("digest") if isinstance(config_descriptor, dict) else None
-        )
-        if not config_digest:
-            return None
-
-        # Config blob is a small JSON document; just fetch it. ``Authorization``
-        # is still required (GHCR's blob endpoints use the same anon-pull
-        # token), but the manifest media types are not.
-        #
-        # ``follow_redirects=True`` is essential here: GHCR serves blobs
-        # via a 307 redirect to ``pkg-containers.githubusercontent.com``,
-        # the shared httpx client at the call site has the default
-        # ``follow_redirects=False``, so without this kwarg ``rc`` would
-        # come back as a 307 with an HTML body, ``raise_for_status`` would
-        # not fire (3xx is not an error), and ``rc.json()`` would explode —
-        # making this whole function silently return None on every call.
-        rc = await client.get(
-            f"https://ghcr.io/v2/{repo}/blobs/{config_digest}",
-            headers={"Authorization": f"Bearer {token}"},
-            timeout=15.0,
-            follow_redirects=True,
-        )
-        rc.raise_for_status()
-        blob = rc.json()
-        # OCI image config has labels under ``config.Labels``; some older
-        # docker schema variants nest them under top-level ``Labels``. Cover
-        # both paths.
-        labels = (
-            ((blob.get("config") if isinstance(blob, dict) else None) or {}).get("Labels")
-            or (blob.get("Labels") if isinstance(blob, dict) else None)
-            or {}
-        )
-        version = labels.get("org.opencontainers.image.version")
-        if isinstance(version, str) and version:
-            return version
-        return None
-    except (httpx.HTTPError, RuntimeError, ValueError) as exc:
-        logger.warning("remote version lookup failed for %s: %s", image, exc)
-        return None
-
-
-# ---------------------------------------------------------------------------
-# State file
-# ---------------------------------------------------------------------------
+    return tag.lstrip("v") or None
 
 
 def _atomic_write_json(path: Path, payload: dict[str, Any]) -> None:
-    """Write JSON to ``path`` via a temp-file-and-rename on the same dir."""
     path.parent.mkdir(parents=True, exist_ok=True)
     fd, tmp = tempfile.mkstemp(prefix=".updates.", dir=str(path.parent))
     try:
@@ -348,7 +179,6 @@ def _atomic_write_json(path: Path, payload: dict[str, Any]) -> None:
             f.write("\n")
         os.replace(tmp, path)
     except Exception:
-        # Best-effort cleanup; swallow secondary errors.
         try:
             os.unlink(tmp)
         except OSError:
@@ -357,298 +187,463 @@ def _atomic_write_json(path: Path, payload: dict[str, Any]) -> None:
 
 
 async def run_check() -> dict[str, Any]:
-    """One-shot: probe remote + local digests for core and admin, write state."""
-    global _last_check, _last_error
+    """Probe latest GitHub Releases tags, write state file, return payload."""
+    global _last_check_at, _last_check_error
+
+    cfg = _config()
+    core_repo = cfg.get("SYGEN_CORE_GITHUB_REPO", "alexeymorozua/sygen")
+    admin_repo = cfg.get("SYGEN_ADMIN_GITHUB_REPO", "alexeymorozua/sygen-admin")
+    core_current = cfg.get("SYGEN_CORE_VERSION", "")
+    admin_current = cfg.get("SYGEN_ADMIN_VERSION", "")
+
+    loop = asyncio.get_event_loop()
+    core_latest, admin_latest = await asyncio.gather(
+        loop.run_in_executor(None, fetch_latest_version, core_repo),
+        loop.run_in_executor(None, fetch_latest_version, admin_repo),
+    )
 
     now = dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds").replace(
         "+00:00", "Z"
     )
-    result: dict[str, Any] = {"checked_at": now}
-
-    targets = [("core", CORE_IMAGE, CORE_CONTAINER), ("admin", ADMIN_IMAGE, ADMIN_CONTAINER)]
-
-    async with httpx.AsyncClient() as registry_client, httpx.AsyncClient(
-        transport=_docker_transport()
-    ) as docker_client:
-        for key, image, container in targets:
-            entry: dict[str, Any] = {
-                "image": image,
-                "current": None,
-                "latest": None,
-                "update_available": False,
-                "checked_at": now,
-                "error": None,
-                # Semver siblings of ``current``/``latest`` for the mobile +
-                # admin About-section / update banner subtitle. ``null`` when
-                # the image lacks the ``org.opencontainers.image.version``
-                # OCI label or the registry hop fails.
-                "version": None,
-                "latest_version": None,
-            }
-            try:
-                entry["latest"] = await fetch_remote_digest(registry_client, image)
-            except Exception as exc:
-                entry["error"] = f"remote: {exc}"
-                logger.warning("%s: remote digest failed: %s", key, exc)
-
-            entry["current"] = await fetch_local_digest(docker_client, container)
-            entry["version"] = await fetch_local_version(docker_client, container)
-            entry["latest_version"] = await fetch_remote_version(registry_client, image)
-
-            if entry["current"] and entry["latest"]:
-                entry["update_available"] = entry["current"] != entry["latest"]
-
-            result[key] = entry
-
+    payload = {
+        "checked_at": now,
+        "core": {
+            "repo": core_repo,
+            "current": core_current,
+            "latest": core_latest,
+            "version": core_current,
+            "latest_version": core_latest,
+            "update_available": bool(
+                core_latest and core_current and core_latest != core_current
+            ),
+            "error": None if core_latest else "github releases api error",
+        },
+        "admin": {
+            "repo": admin_repo,
+            "current": admin_current,
+            "latest": admin_latest,
+            "version": admin_current,
+            "latest_version": admin_latest,
+            "update_available": bool(
+                admin_latest and admin_current and admin_latest != admin_current
+            ),
+            "error": None if admin_latest else "github releases api error",
+        },
+    }
     try:
-        _atomic_write_json(STATE_PATH, result)
-        _last_check = now
-        _last_error = None
-        logger.info(
-            "check complete core=%s admin=%s",
-            result.get("core", {}).get("update_available"),
-            result.get("admin", {}).get("update_available"),
-        )
-    except Exception as exc:  # pragma: no cover — disk failure
-        _last_error = str(exc)
-        logger.error("failed to write state: %s", exc)
-
-    return result
+        _atomic_write_json(STATE_PATH, payload)
+        _last_check_at = now
+        _last_check_error = None
+    except OSError as exc:
+        _last_check_error = str(exc)
+        logger.error("write %s: %s", STATE_PATH, exc)
+    return payload
 
 
 async def periodic_checker() -> None:
-    """Background task loop. Runs once at startup, then every CHECK_INTERVAL."""
-    # Slight initial delay so compose finishes wiring before the first check.
     await asyncio.sleep(5)
     while True:
         try:
             await run_check()
-        except Exception as exc:  # pragma: no cover — keep the loop alive
+        except Exception as exc:  # pragma: no cover
             logger.exception("periodic check failed: %s", exc)
         await asyncio.sleep(CHECK_INTERVAL)
 
 
 # ---------------------------------------------------------------------------
-# HTTP handlers
+# Apply: atomic venv + admin swap
 # ---------------------------------------------------------------------------
 
 
-def _auth(authorization: Optional[str] = Header(default=None)) -> None:
-    """Bearer-token guard for /apply."""
-    if not UPDATER_TOKEN:
-        # Fail closed when the sidecar is deployed without a token — this
-        # avoids a silent "anyone on the network can restart the stack"
-        # footgun if install.sh skipped the token generation step.
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="updater token not configured",
-        )
-    if not authorization:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="missing bearer token",
-        )
-    parts = authorization.split(" ", 1)
-    if len(parts) != 2 or parts[0].lower() != "bearer":
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="missing bearer token",
-        )
-    provided = parts[1].strip()
-    # Constant-time compare.
-    import hmac
-
-    if not hmac.compare_digest(provided, UPDATER_TOKEN):
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="invalid token",
-        )
+def _release_asset_url(repo: str, version: str, filename: str) -> str:
+    return f"https://github.com/{repo}/releases/download/v{version}/{filename}"
 
 
-@app.get("/health")
-async def health() -> dict[str, Any]:
-    return {
-        "ok": True,
-        "last_check": _last_check,
-        "last_error": _last_error,
-        "check_interval": CHECK_INTERVAL,
-    }
-
-
-@app.post("/check")
-async def manual_check(_: None = Depends(_auth)) -> dict[str, Any]:
-    """Force a digest-check now without restarting anything."""
-    data = await run_check()
-    return {"ok": True, "data": data}
-
-
-_REDACT_ENVS = (
-    "SYGEN_UPDATER_TOKEN",
-    "CLAUDE_CODE_OAUTH_TOKEN",
-    "ANTHROPIC_API_KEY",
-)
-
-
-def _redact(text: str) -> str:
-    """Scrub known-secret values from compose stdout/stderr before returning
-    to the admin UI. docker compose occasionally echoes the `--env-file`
-    values in error paths (e.g. "unset variable X") — if those contain
-    tokens, they'd leak to the browser. Replace each known secret value
-    with ``***`` so the output stays debuggable without exposing keys.
-    """
-    if not text:
-        return text
-    for env_name in _REDACT_ENVS:
-        value = os.environ.get(env_name, "")
-        if value and len(value) >= 8:
-            text = text.replace(value, "***")
-    return text
-
-
-async def _run_compose(args: list[str]) -> tuple[int, str, str]:
-    """Run ``docker compose <args>`` and capture stdout/stderr.
-
-    Raises ``asyncio.TimeoutError`` if the subprocess does not finish within
-    ``COMPOSE_TIMEOUT`` seconds. The process is killed and reaped before the
-    exception propagates so the caller never leaks a zombie.
-    """
-    cmd = [
-        "docker",
-        "compose",
-        "-f",
-        COMPOSE_FILE,
-        "--env-file",
-        COMPOSE_ENV_FILE,
-        *args,
-    ]
-    logger.info("run: %s", " ".join(cmd))
-    proc = await asyncio.create_subprocess_exec(
-        *cmd,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
+def _download(url: str, dest: Path, timeout: float = 600.0) -> None:
+    """Stream a release asset to ``dest`` via stdlib urllib (handles 302)."""
+    req = urllib.request.Request(
+        url,
+        headers={
+            "User-Agent": "sygen-updater",
+            **(
+                {"Authorization": f"Bearer {os.environ['GH_TOKEN']}"}
+                if os.environ.get("GH_TOKEN")
+                else {}
+            ),
+        },
     )
-    try:
-        stdout_b, stderr_b = await asyncio.wait_for(
-            proc.communicate(), timeout=COMPOSE_TIMEOUT
-        )
-    except asyncio.TimeoutError:
-        logger.error("compose %s exceeded %ss; killing subprocess", args, COMPOSE_TIMEOUT)
-        try:
-            proc.kill()
-        except ProcessLookupError:
-            pass
-        try:
-            await proc.wait()
-        except Exception:  # pragma: no cover — best-effort reap
-            pass
-        raise
-    return proc.returncode or 0, stdout_b.decode(errors="replace"), stderr_b.decode(errors="replace")
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    with urllib.request.urlopen(req, timeout=timeout) as resp, dest.open("wb") as out:
+        shutil.copyfileobj(resp, out, length=1 << 20)
 
 
-@app.post("/apply")
-async def apply_updates(_: None = Depends(_auth)) -> JSONResponse:
-    """Pull + recreate core and admin containers.
+def _python_for_new_venv() -> str:
+    """Pick the Python to seed a new venv. Default: same interpreter we are
+    running inside (so the new venv matches the runtime)."""
+    return os.environ.get("SYGEN_PYTHON_BIN", shutil.which("python3") or "python3")
 
-    Runs ``docker compose pull`` then ``docker compose up -d`` scoped to the
-    ``APPLY_SERVICES`` list. Returns the stdout/stderr of each step and
-    re-runs the digest check so the state file reflects the new versions.
+
+def _restart_service(label: str) -> tuple[int, str]:
+    """Trigger a service restart via the appropriate platform tool.
+
+    macOS: ``launchctl kickstart -k gui/<uid>/<label>`` (where label is
+    e.g. ``pro.sygen.core``).
+    Linux: ``systemctl restart <unit>`` (where unit is e.g. ``sygen-core``).
     """
+    if platform.system() == "Darwin":
+        target = f"gui/{os.getuid()}/{label}"
+        cmd = ["launchctl", "kickstart", "-k", target]
+    else:
+        cmd = ["systemctl", "restart", label]
+    logger.info("restart: %s", " ".join(cmd))
+    proc = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+    return proc.returncode, (proc.stderr or proc.stdout).strip()
+
+
+def _update_env_pin(key: str, value: str) -> None:
+    """Replace KEY= line in $SYGEN_HOME/.env (or append if missing).
+
+    Atomic write via tmp + os.replace. .env stays 0600.
+    """
+    if not ENV_FILE.exists():
+        return
+    lines = ENV_FILE.read_text(encoding="utf-8").splitlines()
+    found = False
+    for i, line in enumerate(lines):
+        if line.startswith(f"{key}="):
+            lines[i] = f"{key}={value}"
+            found = True
+            break
+    if not found:
+        lines.append(f"{key}={value}")
+    tmp = ENV_FILE.with_suffix(".env.tmp")
+    tmp.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, ENV_FILE)
+
+
+def _apply_core(version: str, repo: str) -> None:
+    """Download wheel, install in fresh venv, mv-swap."""
+    wheel_name = f"sygen-{version}-py3-none-any.whl"
+    wheel_url = _release_asset_url(repo, version, wheel_name)
+    wheel_path = Path(tempfile.mkdtemp(prefix="sygen-wheel-")) / wheel_name
+    logger.info("downloading core wheel %s", wheel_url)
+    _download(wheel_url, wheel_path)
+
+    # Build the new venv next to the live one. --clear ensures a clean
+    # site-packages — we never want to inherit stale packages from a
+    # prior aborted apply.
+    venv_new = VENV_DIR.with_name("venv-new")
+    venv_prev = VENV_DIR.with_name("venv-prev")
+    if venv_new.exists():
+        shutil.rmtree(venv_new)
+    logger.info("creating new venv at %s", venv_new)
+    subprocess.run(
+        [_python_for_new_venv(), "-m", "venv", "--clear", str(venv_new)],
+        check=True,
+        timeout=120,
+    )
+    pip_new = venv_new / "bin" / "pip"
+    subprocess.run(
+        [str(pip_new), "install", "--quiet", "--upgrade", "pip", "wheel"],
+        check=True,
+        timeout=120,
+    )
+    logger.info("pip install %s", wheel_path)
+    subprocess.run(
+        [str(pip_new), "install", "--quiet", str(wheel_path)], check=True, timeout=300
+    )
+    # The updater itself runs from the LIVE venv; swapping it out from
+    # under itself would kill us mid-flight. Install sygen-updater into
+    # the new venv anyway so the next service restart picks it up.
+    updater_wheel_url = _release_asset_url(
+        repo, version, f"sygen_updater-{version}-py3-none-any.whl"
+    )
+    updater_wheel_path = wheel_path.with_name(f"sygen_updater-{version}-py3-none-any.whl")
+    try:
+        _download(updater_wheel_url, updater_wheel_path)
+        subprocess.run(
+            [str(pip_new), "install", "--quiet", str(updater_wheel_path)],
+            check=True,
+            timeout=300,
+        )
+    except Exception as exc:
+        logger.warning("could not install sygen-updater into new venv: %s", exc)
+
+    # Atomic mv-swap.
+    if venv_prev.exists():
+        shutil.rmtree(venv_prev)
+    if VENV_DIR.exists():
+        VENV_DIR.rename(venv_prev)
+    venv_new.rename(VENV_DIR)
+    shutil.rmtree(wheel_path.parent, ignore_errors=True)
+
+
+def _apply_admin(version: str, repo: str) -> None:
+    """Download admin tarball, extract, mv-swap."""
+    tarball_name = f"sygen-admin-{version}.tar.gz"
+    tarball_url = _release_asset_url(repo, version, tarball_name)
+    tmp_root = Path(tempfile.mkdtemp(prefix="sygen-admin-"))
+    tarball_path = tmp_root / tarball_name
+    logger.info("downloading admin tarball %s", tarball_url)
+    _download(tarball_url, tarball_path)
+
+    staging = ADMIN_DIR.with_name("admin-new")
+    admin_prev = ADMIN_DIR.with_name("admin-prev")
+    if staging.exists():
+        shutil.rmtree(staging)
+    staging.mkdir(parents=True, exist_ok=True)
+    subprocess.run(
+        ["tar", "-xzf", str(tarball_path), "-C", str(staging)],
+        check=True,
+        timeout=300,
+    )
+    if not (staging / "server.js").exists():
+        raise RuntimeError("admin tarball missing server.js — refusing to swap in")
+
+    if admin_prev.exists():
+        shutil.rmtree(admin_prev)
+    if ADMIN_DIR.exists():
+        ADMIN_DIR.rename(admin_prev)
+    staging.rename(ADMIN_DIR)
+    shutil.rmtree(tmp_root, ignore_errors=True)
+
+
+# ---------------------------------------------------------------------------
+# HTTP server (stdlib aiohttp-free — keeps the venv tiny)
+# ---------------------------------------------------------------------------
+
+
+def _auth_ok(headers: dict[str, str]) -> bool:
+    cfg = _config()
+    token = cfg.get("SYGEN_UPDATER_TOKEN", "")
+    if not token:
+        return False
+    auth = headers.get("authorization", "")
+    if not auth.lower().startswith("bearer "):
+        return False
+    provided = auth[7:].strip()
+    return hmac.compare_digest(provided, token)
+
+
+async def _read_request(reader: asyncio.StreamReader) -> tuple[str, str, dict[str, str], bytes]:
+    """Tiny HTTP/1.1 request parser. Reads request line + headers + body."""
+    request_line = (await reader.readline()).decode("ascii", errors="replace").rstrip("\r\n")
+    parts = request_line.split(" ")
+    if len(parts) < 3:
+        raise ValueError("bad request line")
+    method, path, _ = parts[0], parts[1], parts[2]
+    headers: dict[str, str] = {}
+    while True:
+        line = (await reader.readline()).decode("ascii", errors="replace").rstrip("\r\n")
+        if not line:
+            break
+        if ":" in line:
+            k, v = line.split(":", 1)
+            headers[k.strip().lower()] = v.strip()
+    length = int(headers.get("content-length", "0") or "0")
+    body = await reader.readexactly(length) if length > 0 else b""
+    return method, path, headers, body
+
+
+def _http_response(
+    status_code: int,
+    body: dict[str, Any] | str,
+    *,
+    headers: Optional[dict[str, str]] = None,
+) -> bytes:
+    if isinstance(body, dict):
+        payload = json.dumps(body).encode("utf-8")
+        ctype = "application/json"
+    else:
+        payload = body.encode("utf-8")
+        ctype = "text/plain"
+    reason = {200: "OK", 401: "Unauthorized", 429: "Too Many Requests", 500: "Internal Server Error", 503: "Service Unavailable"}.get(
+        status_code, "OK"
+    )
+    hdrs = {
+        "Content-Type": ctype,
+        "Content-Length": str(len(payload)),
+        "Connection": "close",
+    }
+    if headers:
+        hdrs.update(headers)
+    head = f"HTTP/1.1 {status_code} {reason}\r\n"
+    head += "".join(f"{k}: {v}\r\n" for k, v in hdrs.items())
+    head += "\r\n"
+    return head.encode("ascii") + payload
+
+
+async def _handle_health() -> bytes:
+    return _http_response(
+        200,
+        {
+            "ok": True,
+            "last_check": _last_check_at,
+            "last_error": _last_check_error,
+            "check_interval": CHECK_INTERVAL,
+            "venv_dir": str(VENV_DIR),
+            "admin_dir": str(ADMIN_DIR),
+        },
+    )
+
+
+async def _handle_check(headers: dict[str, str]) -> bytes:
+    if not _auth_ok(headers):
+        return _http_response(401, {"ok": False, "error": "missing or invalid bearer token"})
+    data = await run_check()
+    return _http_response(200, {"ok": True, "data": data})
+
+
+async def _handle_apply(headers: dict[str, str]) -> bytes:
     global _last_apply_at
 
-    # ``async with`` already releases the lock on any exception, so a
-    # compose timeout cannot wedge subsequent /apply calls.
+    if not _auth_ok(headers):
+        return _http_response(401, {"ok": False, "error": "missing or invalid bearer token"})
+    cfg = _config()
+    if not cfg.get("SYGEN_UPDATER_TOKEN"):
+        return _http_response(503, {"ok": False, "error": "updater token not configured"})
+
     async with _apply_lock:
-        now = asyncio.get_event_loop().time()
+        loop = asyncio.get_event_loop()
+        now = loop.time()
         if now - _last_apply_at < _APPLY_MIN_INTERVAL:
             retry_after = int(_APPLY_MIN_INTERVAL - (now - _last_apply_at)) + 1
-            return JSONResponse(
+            return _http_response(
+                429,
                 {"ok": False, "error": "rate limited", "retry_after": retry_after},
-                status_code=429,
                 headers={"Retry-After": str(retry_after)},
             )
         _last_apply_at = now
 
-        services = list(APPLY_SERVICES)
+        # Fetch latest release versions for both core and admin.
+        core_repo = cfg.get("SYGEN_CORE_GITHUB_REPO", "alexeymorozua/sygen")
+        admin_repo = cfg.get("SYGEN_ADMIN_GITHUB_REPO", "alexeymorozua/sygen-admin")
+        core_latest = await loop.run_in_executor(None, fetch_latest_version, core_repo)
+        admin_latest = await loop.run_in_executor(None, fetch_latest_version, admin_repo)
+        if not core_latest or not admin_latest:
+            return _http_response(
+                500,
+                {
+                    "ok": False,
+                    "error": "could not resolve latest versions from GitHub Releases",
+                    "core_latest": core_latest,
+                    "admin_latest": admin_latest,
+                },
+            )
+
+        core_current = cfg.get("SYGEN_CORE_VERSION", "")
+        admin_current = cfg.get("SYGEN_ADMIN_VERSION", "")
+        applied: list[str] = []
 
         try:
-            pull_rc, pull_out, pull_err = await _run_compose(["pull", *services])
+            if core_latest != core_current:
+                logger.info("applying core %s → %s", core_current, core_latest)
+                await asyncio.wait_for(
+                    loop.run_in_executor(None, _apply_core, core_latest, core_repo),
+                    timeout=APPLY_TIMEOUT,
+                )
+                _update_env_pin("SYGEN_CORE_VERSION", core_latest)
+                applied.append(f"core {core_current} → {core_latest}")
+
+            if admin_latest != admin_current:
+                logger.info("applying admin %s → %s", admin_current, admin_latest)
+                await asyncio.wait_for(
+                    loop.run_in_executor(None, _apply_admin, admin_latest, admin_repo),
+                    timeout=APPLY_TIMEOUT,
+                )
+                _update_env_pin("SYGEN_ADMIN_VERSION", admin_latest)
+                applied.append(f"admin {admin_current} → {admin_latest}")
         except asyncio.TimeoutError:
-            return JSONResponse(
-                {
-                    "ok": False,
-                    "error": "compose-timeout",
-                    "stage": "pull",
-                    "timeout_seconds": COMPOSE_TIMEOUT,
-                },
-                status_code=504,
+            return _http_response(
+                504,
+                {"ok": False, "error": "apply timed out", "timeout_seconds": APPLY_TIMEOUT, "applied": applied},
             )
-        if pull_rc != 0:
-            return JSONResponse(
-                {
-                    "ok": False,
-                    "error": "docker compose pull failed",
-                    "rc": pull_rc,
-                    "stdout": _redact(pull_out),
-                    "stderr": _redact(pull_err),
-                },
-                status_code=500,
+        except (subprocess.CalledProcessError, urllib.error.HTTPError, urllib.error.URLError, OSError) as exc:
+            logger.exception("apply failed")
+            return _http_response(
+                500,
+                {"ok": False, "error": f"apply failed: {exc}", "applied": applied},
             )
 
-        try:
-            up_rc, up_out, up_err = await _run_compose(["up", "-d", *services])
-        except asyncio.TimeoutError:
-            return JSONResponse(
-                {
-                    "ok": False,
-                    "error": "compose-timeout",
-                    "stage": "up",
-                    "timeout_seconds": COMPOSE_TIMEOUT,
-                },
-                status_code=504,
-            )
-        if up_rc != 0:
-            return JSONResponse(
-                {
-                    "ok": False,
-                    "error": "docker compose up failed",
-                    "rc": up_rc,
-                    "stdout": _redact(up_out),
-                    "stderr": _redact(up_err),
-                },
-                status_code=500,
-            )
+        # Restart core + admin so the swap takes effect. Updater stays
+        # alive (we're inside it).
+        restarted: list[dict[str, Any]] = []
+        for label, unit in (
+            ("pro.sygen.core", "sygen-core"),
+            ("pro.sygen.admin", "sygen-admin"),
+        ):
+            try:
+                rc, msg = _restart_service(
+                    label if platform.system() == "Darwin" else unit
+                )
+                restarted.append({"target": label if platform.system() == "Darwin" else unit, "rc": rc, "msg": msg})
+            except (subprocess.SubprocessError, OSError) as exc:
+                restarted.append({"target": label, "rc": -1, "msg": str(exc)})
 
-        # Refresh state so the next /api/system/updates read reflects the
-        # new running digests.
-        state_after: dict[str, Any] = {}
-        try:
-            state_after = await run_check()
-        except Exception as exc:  # pragma: no cover
-            logger.warning("post-apply check failed: %s", exc)
-
-        return JSONResponse(
-            {
-                "ok": True,
-                "restarted": services,
-                "pull": {"stdout": _redact(pull_out), "stderr": _redact(pull_err)},
-                "up": {"stdout": _redact(up_out), "stderr": _redact(up_err)},
-                "state": state_after,
-            }
+        # Refresh state so the next /api/system/updates read reflects new pins.
+        state_after = await run_check()
+        return _http_response(
+            200,
+            {"ok": True, "applied": applied, "restarted": restarted, "state": state_after},
         )
 
 
-# ---------------------------------------------------------------------------
-# Startup
-# ---------------------------------------------------------------------------
+async def _serve(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+    try:
+        method, path, headers, _body = await _read_request(reader)
+    except (ValueError, asyncio.IncompleteReadError, ConnectionError):
+        writer.close()
+        return
+    try:
+        path = path.split("?", 1)[0]
+        if method == "GET" and path == "/health":
+            resp = await _handle_health()
+        elif method == "POST" and path == "/check":
+            resp = await _handle_check(headers)
+        elif method == "POST" and path == "/apply":
+            resp = await _handle_apply(headers)
+        else:
+            resp = _http_response(404, {"ok": False, "error": "not found"})
+        writer.write(resp)
+        await writer.drain()
+    except Exception as exc:  # pragma: no cover
+        logger.exception("handler error: %s", exc)
+        try:
+            writer.write(_http_response(500, {"ok": False, "error": "internal error"}))
+            await writer.drain()
+        except ConnectionError:
+            pass
+    finally:
+        writer.close()
+        try:
+            await writer.wait_closed()
+        except Exception:
+            pass
 
 
-@app.on_event("startup")
-async def _startup() -> None:
+async def main() -> None:
     logger.info(
-        "sygen-updater starting — interval=%ss core=%s admin=%s state=%s",
-        CHECK_INTERVAL,
-        CORE_IMAGE,
-        ADMIN_IMAGE,
+        "sygen-updater starting — listen=%s:%s home=%s state=%s interval=%ss",
+        LISTEN_HOST,
+        LISTEN_PORT,
+        SYGEN_HOME,
         STATE_PATH,
+        CHECK_INTERVAL,
     )
     asyncio.create_task(periodic_checker())
+    server = await asyncio.start_server(_serve, LISTEN_HOST, LISTEN_PORT)
+    async with server:
+        await server.serve_forever()
+
+
+def entrypoint() -> None:
+    """Console script entry point — referenced by pyproject.toml."""
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        pass
+
+
+if __name__ == "__main__":
+    entrypoint()

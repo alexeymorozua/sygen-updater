@@ -38,6 +38,7 @@ from __future__ import annotations
 
 import asyncio
 import datetime as dt
+import hashlib
 import hmac
 import json
 import logging
@@ -112,6 +113,9 @@ def _config() -> dict[str, str]:
         "SYGEN_UPDATER_TOKEN",
         "SYGEN_CORE_GITHUB_REPO",
         "SYGEN_ADMIN_GITHUB_REPO",
+        # P0-3: pinned by install.sh so the updater seeds new venvs with
+        # the same brew/apt python the live venv was built with.
+        "SYGEN_PYTHON_BIN",
     ):
         v = os.environ.get(k)
         if v:
@@ -177,6 +181,9 @@ def _atomic_write_json(path: Path, payload: dict[str, Any]) -> None:
         with os.fdopen(fd, "w", encoding="utf-8") as f:
             json.dump(payload, f, indent=2, sort_keys=True)
             f.write("\n")
+        # P1-7: tempfile.mkstemp creates 0600; loosen to 0644 so other
+        # tooling under host_updates/ can read the state file.
+        os.chmod(tmp, 0o644)
         os.replace(tmp, path)
     except Exception:
         try:
@@ -277,10 +284,107 @@ def _download(url: str, dest: Path, timeout: float = 600.0) -> None:
         shutil.copyfileobj(resp, out, length=1 << 20)
 
 
+def _sha256_file(path: Path) -> str:
+    h = hashlib.sha256()
+    with path.open("rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _download_verified(asset_url: str, dest: Path, timeout: float = 600.0) -> None:
+    """P0-2: download a release asset *and* verify its SHA256 against the
+    matching ``<asset>.sha256`` sidecar.
+
+    Sidecar format (matches sha256sum -c): ``<hex>  <basename>``. Missing
+    sidecar = fail closed (raises RuntimeError). The release workflows in
+    sygen + sygen-admin emit these sidecars; absence means the release
+    was published incorrectly and we refuse to install.
+    """
+    _download(asset_url, dest, timeout=timeout)
+    sha_url = asset_url + ".sha256"
+    sha_dest = dest.with_suffix(dest.suffix + ".sha256")
+    try:
+        _download(sha_url, sha_dest, timeout=60.0)
+    except (urllib.error.HTTPError, urllib.error.URLError, OSError) as exc:
+        try:
+            dest.unlink(missing_ok=True)
+            sha_dest.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise RuntimeError(
+            f"missing checksum sidecar at {sha_url} — refusing to install unverified asset ({exc})"
+        ) from exc
+    expected = sha_dest.read_text(encoding="utf-8").split()[0].strip().lower()
+    sha_dest.unlink(missing_ok=True)
+    actual = _sha256_file(dest).lower()
+    if not expected or expected != actual:
+        try:
+            dest.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise RuntimeError(
+            f"SHA256 mismatch for {asset_url} — expected {expected or '<unreadable>'}, got {actual}"
+        )
+
+
 def _python_for_new_venv() -> str:
-    """Pick the Python to seed a new venv. Default: same interpreter we are
-    running inside (so the new venv matches the runtime)."""
-    return os.environ.get("SYGEN_PYTHON_BIN", shutil.which("python3") or "python3")
+    """Pick the Python to seed a new venv.
+
+    Priority: ``SYGEN_PYTHON_BIN`` from .env / process env (pinned to the
+    brew/apt python that install.sh built the live venv with) →
+    ``shutil.which("python3")`` (fallback only). The pin is load-bearing
+    on macOS, where ``shutil.which("python3")`` resolves to
+    ``/usr/bin/python3`` (Apple stub, often 3.9) instead of the brew
+    python@3.14 we want.
+    """
+    pinned = _config().get("SYGEN_PYTHON_BIN")
+    if pinned:
+        return pinned
+    return shutil.which("python3") or "python3"
+
+
+def _macos_plist_path(label: str) -> Path:
+    return Path.home() / "Library" / "LaunchAgents" / f"{label}.plist"
+
+
+def _stop_service(label: str) -> None:
+    """P1-6: fully stop the service so the mv-swap window can't be
+    raced by launchd's KeepAlive (or systemd's Restart=). Best-effort
+    — a missing/inactive service is fine.
+    """
+    if platform.system() == "Darwin":
+        plist = _macos_plist_path(label)
+        if plist.exists():
+            subprocess.run(
+                ["launchctl", "unload", str(plist)],
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+    else:
+        subprocess.run(
+            ["systemctl", "stop", label],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+
+
+def _start_service(label: str) -> tuple[int, str]:
+    """P1-6: start (or load) the service after the mv-swap. Pairs with
+    ``_stop_service``. On macOS this is ``launchctl load -w`` (which
+    also re-arms KeepAlive); on Linux it's ``systemctl start``.
+    """
+    if platform.system() == "Darwin":
+        plist = _macos_plist_path(label)
+        if not plist.exists():
+            return 1, f"plist not found: {plist}"
+        cmd = ["launchctl", "load", "-w", str(plist)]
+    else:
+        cmd = ["systemctl", "start", label]
+    proc = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+    return proc.returncode, (proc.stderr or proc.stdout).strip()
 
 
 def _restart_service(label: str) -> tuple[int, str]:
@@ -298,6 +402,38 @@ def _restart_service(label: str) -> tuple[int, str]:
     logger.info("restart: %s", " ".join(cmd))
     proc = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
     return proc.returncode, (proc.stderr or proc.stdout).strip()
+
+
+def _poll_health(url: str, timeout_seconds: float = 30.0) -> tuple[bool, Optional[int], Optional[str]]:
+    """P1-9: poll an HTTP endpoint until it answers (any non-5xx) or
+    ``timeout_seconds`` elapses. Returns ``(healthy, last_code, last_err)``.
+
+    "Any non-5xx" matches the install.sh smoke-test rule: 200/301/302/401/
+    403/404 all prove the server is alive and routing — only connect
+    failures and 5xx are treated as unhealthy.
+    """
+    import socket
+    import time
+
+    deadline = time.monotonic() + timeout_seconds
+    last_code: Optional[int] = None
+    last_err: Optional[str] = None
+    while time.monotonic() < deadline:
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": "sygen-updater/health"})
+            with urllib.request.urlopen(req, timeout=3.0) as resp:
+                last_code = resp.status
+                if 200 <= resp.status < 500:
+                    return True, last_code, None
+        except urllib.error.HTTPError as exc:
+            last_code = exc.code
+            if 200 <= exc.code < 500:
+                return True, last_code, None
+            last_err = f"HTTP {exc.code}"
+        except (urllib.error.URLError, socket.timeout, ConnectionError, OSError) as exc:
+            last_err = str(exc)
+        time.sleep(1.0)
+    return False, last_code, last_err
 
 
 def _update_env_pin(key: str, value: str) -> None:
@@ -322,13 +458,31 @@ def _update_env_pin(key: str, value: str) -> None:
     os.replace(tmp, ENV_FILE)
 
 
+_CORE_LABEL_DARWIN = "pro.sygen.core"
+_CORE_LABEL_LINUX = "sygen-core"
+_ADMIN_LABEL_DARWIN = "pro.sygen.admin"
+_ADMIN_LABEL_LINUX = "sygen-admin"
+
+
+def _service_label(role: str) -> str:
+    """``role`` is ``core`` or ``admin``. Returns the platform-specific label."""
+    if role == "core":
+        return _CORE_LABEL_DARWIN if platform.system() == "Darwin" else _CORE_LABEL_LINUX
+    return _ADMIN_LABEL_DARWIN if platform.system() == "Darwin" else _ADMIN_LABEL_LINUX
+
+
 def _apply_core(version: str, repo: str) -> None:
-    """Download wheel, install in fresh venv, mv-swap."""
+    """Download wheel (SHA256-verified), install in fresh venv, mv-swap.
+
+    The mv-swap is bracketed by stop/start of the core service so launchd's
+    KeepAlive (or systemd Restart=always) can't respawn into the empty
+    $VENV_DIR window between the two ``rename()`` calls (P1-6).
+    """
     wheel_name = f"sygen-{version}-py3-none-any.whl"
     wheel_url = _release_asset_url(repo, version, wheel_name)
     wheel_path = Path(tempfile.mkdtemp(prefix="sygen-wheel-")) / wheel_name
-    logger.info("downloading core wheel %s", wheel_url)
-    _download(wheel_url, wheel_path)
+    logger.info("downloading + verifying core wheel %s", wheel_url)
+    _download_verified(wheel_url, wheel_path)
 
     # Build the new venv next to the live one. --clear ensures a clean
     # site-packages — we never want to inherit stale packages from a
@@ -337,7 +491,7 @@ def _apply_core(version: str, repo: str) -> None:
     venv_prev = VENV_DIR.with_name("venv-prev")
     if venv_new.exists():
         shutil.rmtree(venv_new)
-    logger.info("creating new venv at %s", venv_new)
+    logger.info("creating new venv at %s with %s", venv_new, _python_for_new_venv())
     subprocess.run(
         [_python_for_new_venv(), "-m", "venv", "--clear", str(venv_new)],
         check=True,
@@ -361,7 +515,7 @@ def _apply_core(version: str, repo: str) -> None:
     )
     updater_wheel_path = wheel_path.with_name(f"sygen_updater-{version}-py3-none-any.whl")
     try:
-        _download(updater_wheel_url, updater_wheel_path)
+        _download_verified(updater_wheel_url, updater_wheel_path)
         subprocess.run(
             [str(pip_new), "install", "--quiet", str(updater_wheel_path)],
             check=True,
@@ -370,23 +524,43 @@ def _apply_core(version: str, repo: str) -> None:
     except Exception as exc:
         logger.warning("could not install sygen-updater into new venv: %s", exc)
 
-    # Atomic mv-swap.
-    if venv_prev.exists():
-        shutil.rmtree(venv_prev)
-    if VENV_DIR.exists():
-        VENV_DIR.rename(venv_prev)
-    venv_new.rename(VENV_DIR)
+    # P1-6: stop core *before* the swap, restart after, so KeepAlive can't
+    # respawn into the empty-VENV_DIR window. If the second rename fails,
+    # restore venv_prev → VENV_DIR before re-starting so we never start
+    # the service against a missing path.
+    core_label = _service_label("core")
+    _stop_service(core_label)
+    try:
+        if venv_prev.exists():
+            shutil.rmtree(venv_prev)
+        renamed_away = False
+        if VENV_DIR.exists():
+            VENV_DIR.rename(venv_prev)
+            renamed_away = True
+        try:
+            venv_new.rename(VENV_DIR)
+        except OSError:
+            if renamed_away and venv_prev.exists():
+                venv_prev.rename(VENV_DIR)
+            raise
+    finally:
+        _start_service(core_label)
     shutil.rmtree(wheel_path.parent, ignore_errors=True)
 
 
 def _apply_admin(version: str, repo: str) -> None:
-    """Download admin tarball, extract, mv-swap."""
+    """Download admin tarball (SHA256-verified), extract, mv-swap.
+
+    Same stop/start bracketing as ``_apply_core`` — the empty-$ADMIN_DIR
+    window between the two ``rename()`` calls would otherwise let
+    KeepAlive respawn ``node $ADMIN_DIR/server.js`` against ENOENT.
+    """
     tarball_name = f"sygen-admin-{version}.tar.gz"
     tarball_url = _release_asset_url(repo, version, tarball_name)
     tmp_root = Path(tempfile.mkdtemp(prefix="sygen-admin-"))
     tarball_path = tmp_root / tarball_name
-    logger.info("downloading admin tarball %s", tarball_url)
-    _download(tarball_url, tarball_path)
+    logger.info("downloading + verifying admin tarball %s", tarball_url)
+    _download_verified(tarball_url, tarball_path)
 
     staging = ADMIN_DIR.with_name("admin-new")
     admin_prev = ADMIN_DIR.with_name("admin-prev")
@@ -401,11 +575,23 @@ def _apply_admin(version: str, repo: str) -> None:
     if not (staging / "server.js").exists():
         raise RuntimeError("admin tarball missing server.js — refusing to swap in")
 
-    if admin_prev.exists():
-        shutil.rmtree(admin_prev)
-    if ADMIN_DIR.exists():
-        ADMIN_DIR.rename(admin_prev)
-    staging.rename(ADMIN_DIR)
+    admin_label = _service_label("admin")
+    _stop_service(admin_label)
+    try:
+        if admin_prev.exists():
+            shutil.rmtree(admin_prev)
+        renamed_away = False
+        if ADMIN_DIR.exists():
+            ADMIN_DIR.rename(admin_prev)
+            renamed_away = True
+        try:
+            staging.rename(ADMIN_DIR)
+        except OSError:
+            if renamed_away and admin_prev.exists():
+                admin_prev.rename(ADMIN_DIR)
+            raise
+    finally:
+        _start_service(admin_label)
     shutil.rmtree(tmp_root, ignore_errors=True)
 
 
@@ -426,6 +612,17 @@ def _auth_ok(headers: dict[str, str]) -> bool:
     return hmac.compare_digest(provided, token)
 
 
+# P1-11: cap accepted request body. Local-only attack surface
+# (LISTEN_HOST=127.0.0.1) but on a shared dev mac it's nonzero; 1 MiB
+# is comfortably above any legitimate /apply request (zero body in
+# practice — auth-only POST).
+_MAX_REQUEST_BODY = 1 << 20
+
+
+class _RequestTooLarge(ValueError):
+    """Raised when Content-Length exceeds ``_MAX_REQUEST_BODY``."""
+
+
 async def _read_request(reader: asyncio.StreamReader) -> tuple[str, str, dict[str, str], bytes]:
     """Tiny HTTP/1.1 request parser. Reads request line + headers + body."""
     request_line = (await reader.readline()).decode("ascii", errors="replace").rstrip("\r\n")
@@ -441,7 +638,14 @@ async def _read_request(reader: asyncio.StreamReader) -> tuple[str, str, dict[st
         if ":" in line:
             k, v = line.split(":", 1)
             headers[k.strip().lower()] = v.strip()
-    length = int(headers.get("content-length", "0") or "0")
+    try:
+        length = int(headers.get("content-length", "0") or "0")
+    except ValueError:
+        length = 0
+    if length < 0:
+        length = 0
+    if length > _MAX_REQUEST_BODY:
+        raise _RequestTooLarge(f"content-length {length} > limit {_MAX_REQUEST_BODY}")
     body = await reader.readexactly(length) if length > 0 else b""
     return method, path, headers, body
 
@@ -458,9 +662,18 @@ def _http_response(
     else:
         payload = body.encode("utf-8")
         ctype = "text/plain"
-    reason = {200: "OK", 401: "Unauthorized", 429: "Too Many Requests", 500: "Internal Server Error", 503: "Service Unavailable"}.get(
-        status_code, "OK"
-    )
+    # P1-12: include 404 + 413 + 504 so strict HTTP parsers don't reject
+    # "OK" as the reason for non-200 codes.
+    reason = {
+        200: "OK",
+        401: "Unauthorized",
+        404: "Not Found",
+        413: "Payload Too Large",
+        429: "Too Many Requests",
+        500: "Internal Server Error",
+        503: "Service Unavailable",
+        504: "Gateway Timeout",
+    }.get(status_code, "OK")
     hdrs = {
         "Content-Type": ctype,
         "Content-Length": str(len(payload)),
@@ -567,7 +780,10 @@ async def _handle_apply(headers: dict[str, str]) -> bytes:
             )
 
         # Restart core + admin so the swap takes effect. Updater stays
-        # alive (we're inside it).
+        # alive (we're inside it). _apply_* already stop+start the affected
+        # service to bracket the mv-swap (P1-6); the kickstart here is
+        # belt-and-suspenders so a no-op _apply (e.g. version unchanged
+        # but operator forced /apply) still picks up new env or .plist.
         restarted: list[dict[str, Any]] = []
         for label, unit in (
             ("pro.sygen.core", "sygen-core"),
@@ -581,17 +797,56 @@ async def _handle_apply(headers: dict[str, str]) -> bytes:
             except (subprocess.SubprocessError, OSError) as exc:
                 restarted.append({"target": label, "rc": -1, "msg": str(exc)})
 
+        # P1-9: health poll. After kicking the services, give them up to
+        # 30s to answer. We don't auto-rollback yet (architectural follow-
+        # up for v1.7.1) — just report ``healthy=false`` so the admin UI
+        # can surface the failure and the operator can decide.
+        admin_port = cfg.get("SYGEN_ADMIN_PORT", os.environ.get("SYGEN_ADMIN_PORT", "8080"))
+        core_url = "http://127.0.0.1:8081/api/system/status"
+        admin_url = f"http://127.0.0.1:{admin_port}/"
+        core_healthy, core_code, core_err = await loop.run_in_executor(
+            None, _poll_health, core_url, 30.0
+        )
+        admin_healthy, admin_code, admin_err = await loop.run_in_executor(
+            None, _poll_health, admin_url, 30.0
+        )
+        healthy = core_healthy and admin_healthy
+
         # Refresh state so the next /api/system/updates read reflects new pins.
         state_after = await run_check()
         return _http_response(
             200,
-            {"ok": True, "applied": applied, "restarted": restarted, "state": state_after},
+            {
+                "ok": True,
+                "applied": applied,
+                "restarted": restarted,
+                "state": state_after,
+                "healthy": healthy,
+                "rolled_back": False,
+                "health": {
+                    "core": {"healthy": core_healthy, "last_code": core_code, "last_error": core_err},
+                    "admin": {"healthy": admin_healthy, "last_code": admin_code, "last_error": admin_err},
+                },
+            },
         )
 
 
 async def _serve(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
     try:
         method, path, headers, _body = await _read_request(reader)
+    except _RequestTooLarge as exc:
+        try:
+            writer.write(
+                _http_response(
+                    413,
+                    {"ok": False, "error": str(exc), "max_bytes": _MAX_REQUEST_BODY},
+                )
+            )
+            await writer.drain()
+        except ConnectionError:
+            pass
+        writer.close()
+        return
     except (ValueError, asyncio.IncompleteReadError, ConnectionError):
         writer.close()
         return
@@ -631,6 +886,10 @@ async def main() -> None:
         STATE_PATH,
         CHECK_INTERVAL,
     )
+    # P0-3: surface the resolved Python interpreter so the operator can
+    # verify after each restart that the updater will seed new venvs
+    # with the same brew/apt python the live venv was built with.
+    logger.info("Updater: using python at %s", _python_for_new_venv())
     asyncio.create_task(periodic_checker())
     server = await asyncio.start_server(_serve, LISTEN_HOST, LISTEN_PORT)
     async with server:

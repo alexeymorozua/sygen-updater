@@ -6,14 +6,25 @@ venv + admin tarball atomically.
 
 Architecture:
 
-1. Every ``CHECK_INTERVAL`` seconds, GET the GitHub Releases API for the
-   ``alexeymorozua/sygen`` and ``alexeymorozua/sygen-admin`` repos, take
-   the latest release's ``tag_name`` (e.g. ``v1.6.75``), strip the
-   leading ``v`` to get the version. Compare to the version pinned in
-   ``$SYGEN_HOME/.env`` (``SYGEN_CORE_VERSION`` /
-   ``SYGEN_ADMIN_VERSION``). Write the result atomically to
-   ``$SYGEN_HOME/host_updates/_updates.json`` — core reads it back via
-   ``GET /api/system/updates``.
+1. Every ``CHECK_INTERVAL`` seconds, query the GitHub Releases API and
+   resolve the latest available core and admin versions:
+
+   * **Mirror mode (default)** — query ``repos/<releases_repo>/releases``
+     once, filter by ``tag_name`` prefix (``core-`` for sygen+sygen-updater
+     wheels, ``admin-`` for the sygen-admin tarball), pick the highest
+     numeric semver. ``releases_repo`` defaults to
+     ``alexeymorozua/sygen-releases``: a public repo that auto-mirrors
+     release artefacts from the private source repos so anonymous curl
+     can reach them. Override via ``SYGEN_RELEASES_GITHUB_REPO``.
+   * **Legacy mode** — set ``SYGEN_RELEASES_GITHUB_REPO=`` (empty) to
+     fall back to ``repos/<source>/releases/latest`` against the private
+     source repos with ``v<version>`` tags. Only useful when running
+     against a fork that hasn't adopted the public mirror layout.
+
+   The result is compared against the versions pinned in
+   ``$SYGEN_HOME/.env`` (``SYGEN_CORE_VERSION`` / ``SYGEN_ADMIN_VERSION``)
+   and written atomically to ``$SYGEN_HOME/host_updates/_updates.json``
+   — core reads it back via ``GET /api/system/updates``.
 
 2. Expose ``GET /health`` (unauthenticated, used by smoke tests).
 
@@ -113,14 +124,39 @@ def _config() -> dict[str, str]:
         "SYGEN_UPDATER_TOKEN",
         "SYGEN_CORE_GITHUB_REPO",
         "SYGEN_ADMIN_GITHUB_REPO",
+        "SYGEN_RELEASES_GITHUB_REPO",
         # P0-3: pinned by install.sh so the updater seeds new venvs with
         # the same brew/apt python the live venv was built with.
         "SYGEN_PYTHON_BIN",
     ):
         v = os.environ.get(k)
-        if v:
+        if v is not None:
+            # Empty string is a meaningful override (opt-in to legacy mode
+            # for SYGEN_RELEASES_GITHUB_REPO), so we copy it verbatim.
             cfg[k] = v
     return cfg
+
+
+_DEFAULT_RELEASES_REPO = "alexeymorozua/sygen-releases"
+_DEFAULT_CORE_REPO = "alexeymorozua/sygen"
+_DEFAULT_ADMIN_REPO = "alexeymorozua/sygen-admin"
+
+
+def _releases_repo(cfg: dict[str, str]) -> str:
+    """Return the public mirror repo to poll, or empty string for legacy mode.
+
+    The key may be absent (→ default mirror) or explicitly empty (→ legacy
+    v-tag mode against the private source repos).
+    """
+    if "SYGEN_RELEASES_GITHUB_REPO" not in cfg:
+        return _DEFAULT_RELEASES_REPO
+    return cfg["SYGEN_RELEASES_GITHUB_REPO"].strip()
+
+
+def _legacy_source_repo(cfg: dict[str, str], component: str) -> str:
+    if component == "core":
+        return cfg.get("SYGEN_CORE_GITHUB_REPO", _DEFAULT_CORE_REPO)
+    return cfg.get("SYGEN_ADMIN_GITHUB_REPO", _DEFAULT_ADMIN_REPO)
 
 
 # Per-process apply lock + rate limit. The /apply call is destructive and
@@ -157,10 +193,11 @@ def _http_get_json(url: str, timeout: float = 15.0) -> Any:
 
 
 def fetch_latest_version(repo: str) -> Optional[str]:
-    """Return the latest released tag of ``repo`` (e.g. "1.6.74"), or None.
+    """Legacy mode: latest released tag of ``repo`` (e.g. "1.6.74") or None.
 
     Strips the leading ``v`` so the returned string is comparable to the
-    semver values pinned in .env.
+    semver values pinned in .env. Used only when
+    ``SYGEN_RELEASES_GITHUB_REPO`` is explicitly set to an empty string.
     """
     url = f"https://api.github.com/repos/{repo}/releases/latest"
     try:
@@ -172,6 +209,73 @@ def fetch_latest_version(repo: str) -> Optional[str]:
     if not isinstance(tag, str):
         return None
     return tag.lstrip("v") or None
+
+
+def _parse_semver(s: str) -> Optional[tuple[int, ...]]:
+    """Strict numeric semver: ``X.Y.Z`` (or longer) of integers only.
+
+    Returns None for pre-release tags like ``1.6.75-rc1`` so we never auto-
+    apply them — the install.sh / mirror tagging convention treats those as
+    out of band, not the floor of "latest".
+    """
+    if not s:
+        return None
+    parts = s.split(".")
+    try:
+        return tuple(int(p) for p in parts)
+    except ValueError:
+        return None
+
+
+def fetch_latest_from_mirror(releases_repo: str, prefix: str) -> Optional[str]:
+    """Mirror mode: list releases of ``releases_repo``, filter by tag prefix
+    (``core-`` or ``admin-``), return the highest numeric semver.
+
+    Skips draft and pre-release entries. Pulls a single page of 100 — the
+    mirror auto-prunes old artefacts so the latest is always near the top.
+    """
+    url = f"https://api.github.com/repos/{releases_repo}/releases?per_page=100"
+    try:
+        data = _http_get_json(url)
+    except (urllib.error.HTTPError, urllib.error.URLError, ValueError, OSError) as exc:
+        logger.warning("GitHub Releases API error for %s: %s", releases_repo, exc)
+        return None
+    if not isinstance(data, list):
+        return None
+    best: Optional[tuple[tuple[int, ...], str]] = None
+    for rel in data:
+        if not isinstance(rel, dict):
+            continue
+        if rel.get("draft") or rel.get("prerelease"):
+            continue
+        tag = rel.get("tag_name")
+        if not isinstance(tag, str) or not tag.startswith(prefix):
+            continue
+        version_str = tag[len(prefix):]
+        version = _parse_semver(version_str)
+        if version is None:
+            continue
+        if best is None or version > best[0]:
+            best = (version, version_str)
+    return best[1] if best else None
+
+
+def fetch_latest_for(cfg: dict[str, str], component: str) -> Optional[str]:
+    """Resolve the latest available version of ``component`` (``core`` or
+    ``admin``) honoring mirror vs legacy mode.
+    """
+    releases_repo = _releases_repo(cfg)
+    if releases_repo:
+        return fetch_latest_from_mirror(releases_repo, f"{component}-")
+    return fetch_latest_version(_legacy_source_repo(cfg, component))
+
+
+def _payload_repo(cfg: dict[str, str], component: str) -> str:
+    """Repo string surfaced to the admin UI for the "where did this version
+    come from" link. Mirror in mirror mode, source in legacy mode.
+    """
+    releases_repo = _releases_repo(cfg)
+    return releases_repo if releases_repo else _legacy_source_repo(cfg, component)
 
 
 def _atomic_write_json(path: Path, payload: dict[str, Any]) -> None:
@@ -198,15 +302,13 @@ async def run_check() -> dict[str, Any]:
     global _last_check_at, _last_check_error
 
     cfg = _config()
-    core_repo = cfg.get("SYGEN_CORE_GITHUB_REPO", "alexeymorozua/sygen")
-    admin_repo = cfg.get("SYGEN_ADMIN_GITHUB_REPO", "alexeymorozua/sygen-admin")
     core_current = cfg.get("SYGEN_CORE_VERSION", "")
     admin_current = cfg.get("SYGEN_ADMIN_VERSION", "")
 
     loop = asyncio.get_event_loop()
     core_latest, admin_latest = await asyncio.gather(
-        loop.run_in_executor(None, fetch_latest_version, core_repo),
-        loop.run_in_executor(None, fetch_latest_version, admin_repo),
+        loop.run_in_executor(None, fetch_latest_for, cfg, "core"),
+        loop.run_in_executor(None, fetch_latest_for, cfg, "admin"),
     )
 
     now = dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds").replace(
@@ -215,7 +317,7 @@ async def run_check() -> dict[str, Any]:
     payload = {
         "checked_at": now,
         "core": {
-            "repo": core_repo,
+            "repo": _payload_repo(cfg, "core"),
             "current": core_current,
             "latest": core_latest,
             "version": core_current,
@@ -226,7 +328,7 @@ async def run_check() -> dict[str, Any]:
             "error": None if core_latest else "github releases api error",
         },
         "admin": {
-            "repo": admin_repo,
+            "repo": _payload_repo(cfg, "admin"),
             "current": admin_current,
             "latest": admin_latest,
             "version": admin_current,
@@ -262,8 +364,18 @@ async def periodic_checker() -> None:
 # ---------------------------------------------------------------------------
 
 
-def _release_asset_url(repo: str, version: str, filename: str) -> str:
-    return f"https://github.com/{repo}/releases/download/v{version}/{filename}"
+def _release_asset_url(component: str, version: str, filename: str, cfg: Optional[dict[str, str]] = None) -> str:
+    """Resolve the release asset URL.
+
+    Mirror mode (default): ``<releases_repo>/releases/download/<component>-<version>/<filename>``
+    Legacy mode: ``<source_repo>/releases/download/v<version>/<filename>``
+    """
+    cfg = cfg if cfg is not None else _config()
+    releases_repo = _releases_repo(cfg)
+    if releases_repo:
+        return f"https://github.com/{releases_repo}/releases/download/{component}-{version}/{filename}"
+    legacy_repo = _legacy_source_repo(cfg, component)
+    return f"https://github.com/{legacy_repo}/releases/download/v{version}/{filename}"
 
 
 def _download(url: str, dest: Path, timeout: float = 600.0) -> None:
@@ -471,15 +583,16 @@ def _service_label(role: str) -> str:
     return _ADMIN_LABEL_DARWIN if platform.system() == "Darwin" else _ADMIN_LABEL_LINUX
 
 
-def _apply_core(version: str, repo: str) -> None:
+def _apply_core(version: str) -> None:
     """Download wheel (SHA256-verified), install in fresh venv, mv-swap.
 
     The mv-swap is bracketed by stop/start of the core service so launchd's
     KeepAlive (or systemd Restart=always) can't respawn into the empty
     $VENV_DIR window between the two ``rename()`` calls (P1-6).
     """
+    cfg = _config()
     wheel_name = f"sygen-{version}-py3-none-any.whl"
-    wheel_url = _release_asset_url(repo, version, wheel_name)
+    wheel_url = _release_asset_url("core", version, wheel_name, cfg)
     wheel_path = Path(tempfile.mkdtemp(prefix="sygen-wheel-")) / wheel_name
     logger.info("downloading + verifying core wheel %s", wheel_url)
     _download_verified(wheel_url, wheel_path)
@@ -511,7 +624,7 @@ def _apply_core(version: str, repo: str) -> None:
     # under itself would kill us mid-flight. Install sygen-updater into
     # the new venv anyway so the next service restart picks it up.
     updater_wheel_url = _release_asset_url(
-        repo, version, f"sygen_updater-{version}-py3-none-any.whl"
+        "core", version, f"sygen_updater-{version}-py3-none-any.whl", cfg
     )
     updater_wheel_path = wheel_path.with_name(f"sygen_updater-{version}-py3-none-any.whl")
     try:
@@ -548,15 +661,16 @@ def _apply_core(version: str, repo: str) -> None:
     shutil.rmtree(wheel_path.parent, ignore_errors=True)
 
 
-def _apply_admin(version: str, repo: str) -> None:
+def _apply_admin(version: str) -> None:
     """Download admin tarball (SHA256-verified), extract, mv-swap.
 
     Same stop/start bracketing as ``_apply_core`` — the empty-$ADMIN_DIR
     window between the two ``rename()`` calls would otherwise let
     KeepAlive respawn ``node $ADMIN_DIR/server.js`` against ENOENT.
     """
+    cfg = _config()
     tarball_name = f"sygen-admin-{version}.tar.gz"
-    tarball_url = _release_asset_url(repo, version, tarball_name)
+    tarball_url = _release_asset_url("admin", version, tarball_name, cfg)
     tmp_root = Path(tempfile.mkdtemp(prefix="sygen-admin-"))
     tarball_path = tmp_root / tarball_name
     logger.info("downloading + verifying admin tarball %s", tarball_url)
@@ -729,11 +843,9 @@ async def _handle_apply(headers: dict[str, str]) -> bytes:
             )
         _last_apply_at = now
 
-        # Fetch latest release versions for both core and admin.
-        core_repo = cfg.get("SYGEN_CORE_GITHUB_REPO", "alexeymorozua/sygen")
-        admin_repo = cfg.get("SYGEN_ADMIN_GITHUB_REPO", "alexeymorozua/sygen-admin")
-        core_latest = await loop.run_in_executor(None, fetch_latest_version, core_repo)
-        admin_latest = await loop.run_in_executor(None, fetch_latest_version, admin_repo)
+        # Fetch latest release versions for both core and admin (mirror-aware).
+        core_latest = await loop.run_in_executor(None, fetch_latest_for, cfg, "core")
+        admin_latest = await loop.run_in_executor(None, fetch_latest_for, cfg, "admin")
         if not core_latest or not admin_latest:
             return _http_response(
                 500,
@@ -753,7 +865,7 @@ async def _handle_apply(headers: dict[str, str]) -> bytes:
             if core_latest != core_current:
                 logger.info("applying core %s → %s", core_current, core_latest)
                 await asyncio.wait_for(
-                    loop.run_in_executor(None, _apply_core, core_latest, core_repo),
+                    loop.run_in_executor(None, _apply_core, core_latest),
                     timeout=APPLY_TIMEOUT,
                 )
                 _update_env_pin("SYGEN_CORE_VERSION", core_latest)
@@ -762,7 +874,7 @@ async def _handle_apply(headers: dict[str, str]) -> bytes:
             if admin_latest != admin_current:
                 logger.info("applying admin %s → %s", admin_current, admin_latest)
                 await asyncio.wait_for(
-                    loop.run_in_executor(None, _apply_admin, admin_latest, admin_repo),
+                    loop.run_in_executor(None, _apply_admin, admin_latest),
                     timeout=APPLY_TIMEOUT,
                 )
                 _update_env_pin("SYGEN_ADMIN_VERSION", admin_latest)
@@ -907,15 +1019,26 @@ def _warn_on_non_default_repos() -> None:
     this turns the override into a paper trail in the journal.
     """
     cfg = _config()
-    core_repo = cfg.get("SYGEN_CORE_GITHUB_REPO", "alexeymorozua/sygen")
-    admin_repo = cfg.get("SYGEN_ADMIN_GITHUB_REPO", "alexeymorozua/sygen-admin")
-    if core_repo != "alexeymorozua/sygen" or admin_repo != "alexeymorozua/sygen-admin":
+    releases_repo = _releases_repo(cfg)
+    if not releases_repo:
+        # Legacy mode opted in explicitly.
+        core_repo = _legacy_source_repo(cfg, "core")
+        admin_repo = _legacy_source_repo(cfg, "admin")
         logger.warning(
-            "Updater fetching from non-default repos: core=%s, admin=%s. "
-            "Proceed only if this was intentional — an attacker with .env "
-            "write access could redirect updates here.",
+            "Updater in LEGACY mode (SYGEN_RELEASES_GITHUB_REPO=''): polling "
+            "private source repos directly via /releases/latest with v-tags. "
+            "core=%s admin=%s. Anonymous curl can't reach private repos — "
+            "set GH_TOKEN or switch back to mirror mode.",
             core_repo,
             admin_repo,
+        )
+        return
+    if releases_repo != _DEFAULT_RELEASES_REPO:
+        logger.warning(
+            "Updater fetching from non-default mirror repo: %s. "
+            "Proceed only if this was intentional — an attacker with .env "
+            "write access could redirect updates here.",
+            releases_repo,
         )
 
 

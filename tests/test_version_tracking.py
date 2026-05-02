@@ -23,6 +23,7 @@ service start/stop) and assert just the version-tracking behaviour:
 
 from __future__ import annotations
 
+import importlib
 import json
 import os
 import subprocess
@@ -73,12 +74,12 @@ class _ApplyHarness(unittest.TestCase):
     def setUp(self) -> None:
         self._tmp = tempfile.TemporaryDirectory()
         self.root = Path(self._tmp.name)
-        # Mirror the VPS layout: SYGEN_ROOT/data/ holds .env, manifest is at
-        # SYGEN_ROOT/.install_manifest.json (one level above).
+        # Mirror the VPS layout: SYGEN_ROOT holds both .env and the install
+        # manifest, SYGEN_ROOT/data/ is SYGEN_HOME (config/_secrets/etc).
         self.sygen_root = self.root / "sygen"
         self.sygen_home = self.sygen_root / "data"
         self.sygen_home.mkdir(parents=True)
-        self.env_file = self.sygen_home / ".env"
+        self.env_file = self.sygen_root / ".env"
         self.env_file.write_text(
             "SYGEN_CORE_VERSION=1.6.78\n"
             "SYGEN_ADMIN_VERSION=0.5.55\n"
@@ -278,6 +279,42 @@ class UpdateInstallManifestTests(unittest.TestCase):
         updater._update_install_manifest("core_version", "1.6.79")
         siblings = list(self.manifest.parent.iterdir())
         self.assertEqual([p.name for p in siblings], [".install_manifest.json"])
+
+
+class EnvFilePathRegressionTests(unittest.TestCase):
+    """Regression for v1.6.80: ``ENV_FILE`` must resolve under
+    ``SYGEN_ROOT`` (where install.sh writes the .env), not ``SYGEN_HOME``
+    (one level deeper). Pre-1.6.80 the constant was ``SYGEN_HOME / .env``,
+    which on every native install pointed at ``/srv/sygen/data/.env`` —
+    a path install.sh never creates — so ``_update_env_pin`` silently
+    no-op'd and the admin update banner stayed lit after Apply Update.
+
+    Verifies the constant by reloading ``updater`` under a controlled
+    environment, instead of mocking ``ENV_FILE`` directly (which would
+    mask the same regression coming back).
+    """
+
+    def test_env_file_resolves_under_sygen_root(self) -> None:
+        with mock.patch.dict(
+            os.environ,
+            {"SYGEN_ROOT": "/srv/sygen", "SYGEN_HOME": "/srv/sygen/data"},
+            clear=False,
+        ):
+            importlib.reload(updater)
+            try:
+                self.assertEqual(updater.SYGEN_ROOT, Path("/srv/sygen"))
+                self.assertEqual(updater.SYGEN_HOME, Path("/srv/sygen/data"))
+                self.assertEqual(updater.ENV_FILE, Path("/srv/sygen/.env"))
+                self.assertEqual(updater.ENV_FILE.parent, updater.SYGEN_ROOT)
+                self.assertNotEqual(updater.ENV_FILE.parent, updater.SYGEN_HOME)
+                # Co-located with the install manifest — both written by
+                # install.sh into SYGEN_ROOT.
+                self.assertEqual(
+                    updater.ENV_FILE.parent, updater.INSTALL_MANIFEST.parent
+                )
+            finally:
+                # Restore module state for any tests that might run after.
+                importlib.reload(updater)
 
 
 if __name__ == "__main__":

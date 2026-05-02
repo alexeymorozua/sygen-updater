@@ -93,7 +93,10 @@ SYGEN_HOME = _resolve_sygen_home()
 # is unset — wrong on macOS dev (~/.sygen-local), but the manifest doesn't
 # exist there so _update_install_manifest silent no-ops.
 SYGEN_ROOT = Path(os.environ.get("SYGEN_ROOT") or str(SYGEN_HOME.parent))
-ENV_FILE = SYGEN_HOME / ".env"
+# install.sh writes .env into SYGEN_ROOT (one level above SYGEN_HOME on real
+# installs: /srv/sygen/.env with SYGEN_HOME=/srv/sygen/data). Same parent as
+# the install manifest — keeping them co-located.
+ENV_FILE = SYGEN_ROOT / ".env"
 INSTALL_MANIFEST = SYGEN_ROOT / ".install_manifest.json"
 STATE_PATH = Path(
     os.environ.get("STATE_PATH", str(SYGEN_HOME / "host_updates" / "_updates.json"))
@@ -557,7 +560,7 @@ def _poll_health(url: str, timeout_seconds: float = 30.0) -> tuple[bool, Optiona
 
 
 def _update_env_pin(key: str, value: str) -> None:
-    """Replace KEY= line in $SYGEN_HOME/.env (or append if missing).
+    """Replace KEY= line in $SYGEN_ROOT/.env (or append if missing).
 
     Atomic write via tmp + os.replace. .env stays 0600.
     """

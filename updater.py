@@ -55,6 +55,7 @@ import json
 import logging
 import os
 import platform
+import re
 import shutil
 import subprocess
 import tempfile
@@ -570,6 +571,74 @@ def _update_env_pin(key: str, value: str) -> None:
     os.replace(tmp, ENV_FILE)
 
 
+_PYTHON_SHEBANG_RE = re.compile(rb"^#!(\S+/python\d*(?:\.\d+)?)")
+
+
+def _rewrite_venv_shebangs(venv_dir: Path) -> None:
+    """Rewrite stale build-path shebangs in ``venv/bin/*`` and ``pyvenv.cfg``.
+
+    Python's stdlib ``venv`` module bakes the absolute interpreter path into
+    every generated entry-point script (``#!.../bin/python3``) and into
+    ``pyvenv.cfg``'s ``command =`` line. After we rename ``venv-new`` →
+    ``venv`` to atomically swap in the new release, those paths still point
+    at the build-time location (``.../venv-new/bin/python3``) which no
+    longer exists — so ``ExecStart=/srv/sygen/venv/bin/sygen`` fails with
+    ``status=203/EXEC`` and the service flaps. This walks the new ``bin/``
+    directory, rewrites any python shebang to use ``venv_dir/bin/<basename>``,
+    and patches sibling ``venv-*`` paths in ``pyvenv.cfg`` the same way.
+    """
+    # Resolve to an absolute path: shebangs must be absolute to be portable
+    # across the cwd of whichever process exec()s the script (systemd /
+    # launchd both spawn with cwd=/).
+    venv_dir = venv_dir.resolve() if not venv_dir.is_absolute() else venv_dir
+    bin_dir = venv_dir / "bin"
+    if bin_dir.is_dir():
+        for f in bin_dir.iterdir():
+            if not f.is_file():
+                continue
+            try:
+                content = f.read_bytes()
+            except OSError:
+                continue
+            if not content.startswith(b"#!"):
+                continue  # binary (e.g. python interpreter itself) or non-script
+            first_line_end = content.find(b"\n")
+            shebang = content if first_line_end == -1 else content[:first_line_end]
+            m = _PYTHON_SHEBANG_RE.match(shebang)
+            if not m:
+                continue  # non-python shebang (e.g. #!/bin/sh activator) — leave alone
+            old_path = m.group(1).decode()
+            new_path = str(venv_dir / "bin" / Path(old_path).name)
+            if old_path == new_path:
+                continue
+            # Preserve any trailing flags after the interpreter path
+            # (e.g. ``#!/path/python3 -sE``).
+            new_shebang = b"#!" + new_path.encode() + shebang[m.end():]
+            rest = content[len(shebang):] if first_line_end != -1 else b""
+            mode = f.stat().st_mode
+            f.write_bytes(new_shebang + rest)
+            f.chmod(mode)  # write_bytes preserves mode, but be explicit
+
+    cfg = venv_dir / "pyvenv.cfg"
+    if cfg.is_file():
+        try:
+            text = cfg.read_text(encoding="utf-8")
+        except OSError:
+            return
+        # Replace any sibling ``<parent>/venv-<suffix>`` reference (the
+        # build location pip recorded in command=) with the final venv_dir.
+        # System interpreter paths like /opt/homebrew/opt/python@3.14/bin
+        # don't match this anchor and stay untouched.
+        parent_str = str(venv_dir.parent)
+        new_text = re.sub(
+            rf"{re.escape(parent_str)}/venv-[A-Za-z0-9_.-]+",
+            str(venv_dir),
+            text,
+        )
+        if new_text != text:
+            cfg.write_text(new_text, encoding="utf-8")
+
+
 _CORE_LABEL_DARWIN = "pro.sygen.core"
 _CORE_LABEL_LINUX = "sygen-core"
 _ADMIN_LABEL_DARWIN = "pro.sygen.admin"
@@ -653,6 +722,24 @@ def _apply_core(version: str) -> None:
         try:
             venv_new.rename(VENV_DIR)
         except OSError:
+            if renamed_away and venv_prev.exists():
+                venv_prev.rename(VENV_DIR)
+            raise
+        # P0 (1.6.78): pip baked /srv/sygen/venv-new/bin/python3 into every
+        # script's shebang and pyvenv.cfg. After the rename above those
+        # paths point at a directory that no longer exists, so systemd
+        # ExecStart=/srv/sygen/venv/bin/sygen fails 203/EXEC and the unit
+        # flaps. Rewrite shebangs in place to the final venv path. If the
+        # rewrite itself fails mid-way we'd leave VENV_DIR half-patched, so
+        # roll back to venv_prev and let the caller surface the error.
+        try:
+            _rewrite_venv_shebangs(VENV_DIR)
+        except OSError as exc:
+            logger.error("shebang rewrite failed: %s — rolling back venv swap", exc)
+            try:
+                VENV_DIR.rename(venv_new)
+            except OSError:
+                pass
             if renamed_away and venv_prev.exists():
                 venv_prev.rename(VENV_DIR)
             raise

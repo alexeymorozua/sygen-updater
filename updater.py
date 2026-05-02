@@ -877,7 +877,51 @@ async def _serve(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> 
             pass
 
 
+def _enforce_loopback_bind() -> None:
+    """Refuse to expose /apply beyond loopback unless the operator opts in.
+
+    /apply is bearer-authed but executes a privileged venv/admin swap that
+    restarts core+admin. A misconfigured ``SYGEN_UPDATER_HOST=0.0.0.0`` (or
+    a LAN address) silently turns it into a remote-controllable kill switch
+    on the local network. Default 127.0.0.1 is fine; anything else needs
+    explicit ``SYGEN_UPDATER_ALLOW_REMOTE=1`` to acknowledge the risk.
+    """
+    if LISTEN_HOST in ("127.0.0.1", "::1", "localhost"):
+        return
+    if os.environ.get("SYGEN_UPDATER_ALLOW_REMOTE", "0") != "1":
+        raise RuntimeError(
+            f"Refusing to bind on {LISTEN_HOST}. /apply must stay on loopback. "
+            "Set SYGEN_UPDATER_ALLOW_REMOTE=1 only if you know what you're doing."
+        )
+    logger.warning(
+        "Updater binding on non-loopback %s — /apply exposed beyond localhost",
+        LISTEN_HOST,
+    )
+
+
+def _warn_on_non_default_repos() -> None:
+    """Warn loudly when GH release source is overridden.
+
+    An attacker with .env (or process env) write access could redirect the
+    updater to a fork they control and roll the host. Default is silent —
+    this turns the override into a paper trail in the journal.
+    """
+    cfg = _config()
+    core_repo = cfg.get("SYGEN_CORE_GITHUB_REPO", "alexeymorozua/sygen")
+    admin_repo = cfg.get("SYGEN_ADMIN_GITHUB_REPO", "alexeymorozua/sygen-admin")
+    if core_repo != "alexeymorozua/sygen" or admin_repo != "alexeymorozua/sygen-admin":
+        logger.warning(
+            "Updater fetching from non-default repos: core=%s, admin=%s. "
+            "Proceed only if this was intentional — an attacker with .env "
+            "write access could redirect updates here.",
+            core_repo,
+            admin_repo,
+        )
+
+
 async def main() -> None:
+    _enforce_loopback_bind()
+    _warn_on_non_default_repos()
     logger.info(
         "sygen-updater starting — listen=%s:%s home=%s state=%s interval=%ss",
         LISTEN_HOST,

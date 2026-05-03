@@ -207,5 +207,68 @@ class RecordApplyNpmResultsTests(_NpmHookHarness):
         self.assertFalse(self.state.exists())
 
 
+class RunCheckPreservesApplyResultsTests(_NpmHookHarness):
+    """Regression: run_check() must merge with existing state, not clobber.
+
+    Before the merge fix, run_check() wrote a fresh dict and erased
+    last_apply_npm_results that _record_apply_npm_results had just merged in.
+    The periodic checker would then keep clobbering it forever.
+    """
+
+    def test_run_check_preserves_last_apply_npm_results(self) -> None:
+        import asyncio
+
+        self._write_state(
+            {
+                "checked_at": "2026-05-03T00:00:00Z",
+                "core": {"current": "1.6.80"},
+                "admin": {"current": "0.5.57"},
+                "last_apply_npm_results": {
+                    "updated": ["@anthropic-ai/claude-code"],
+                    "skipped": [],
+                    "errors": [],
+                    "checked_at": "2026-05-03T00:00:30Z",
+                },
+            }
+        )
+        with (
+            mock.patch.object(updater, "_config", return_value={
+                "SYGEN_CORE_VERSION": "1.6.81",
+                "SYGEN_ADMIN_VERSION": "0.5.58",
+            }),
+            mock.patch.object(updater, "fetch_latest_for", return_value="1.6.81"),
+        ):
+            asyncio.run(updater.run_check())
+
+        data = json.loads(self.state.read_text(encoding="utf-8"))
+        # New periodic fields written.
+        self.assertEqual(data["core"]["current"], "1.6.81")
+        # Apply results preserved through merge.
+        self.assertEqual(
+            data["last_apply_npm_results"]["updated"],
+            ["@anthropic-ai/claude-code"],
+        )
+
+    def test_run_check_returns_merged_state(self) -> None:
+        import asyncio
+
+        self._write_state(
+            {
+                "last_apply_npm_results": {"updated": ["foo"], "skipped": [], "errors": []},
+            }
+        )
+        with (
+            mock.patch.object(updater, "_config", return_value={
+                "SYGEN_CORE_VERSION": "1.6.81",
+                "SYGEN_ADMIN_VERSION": "0.5.58",
+            }),
+            mock.patch.object(updater, "fetch_latest_for", return_value="1.6.81"),
+        ):
+            result = asyncio.run(updater.run_check())
+
+        self.assertIn("last_apply_npm_results", result)
+        self.assertEqual(result["last_apply_npm_results"]["updated"], ["foo"])
+
+
 if __name__ == "__main__":
     unittest.main()

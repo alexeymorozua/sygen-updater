@@ -350,14 +350,25 @@ async def run_check() -> dict[str, Any]:
             "error": None if admin_latest else "github releases api error",
         },
     }
+
+    existing: dict[str, Any] = {}
+    if STATE_PATH.exists():
+        try:
+            loaded = json.loads(STATE_PATH.read_text(encoding="utf-8"))
+            if isinstance(loaded, dict):
+                existing = loaded
+        except (json.JSONDecodeError, OSError):
+            existing = {}
+    merged = {**existing, **payload}
+
     try:
-        _atomic_write_json(STATE_PATH, payload)
+        _atomic_write_json(STATE_PATH, merged)
         _last_check_at = now
         _last_check_error = None
     except OSError as exc:
         _last_check_error = str(exc)
         logger.error("write %s: %s", STATE_PATH, exc)
-    return payload
+    return merged
 
 
 async def periodic_checker() -> None:

@@ -605,6 +605,101 @@ def _update_install_manifest(key: str, value: str) -> None:
     os.replace(tmp, INSTALL_MANIFEST)
 
 
+def _record_apply_npm_results(results: dict[str, Any]) -> None:
+    """Merge ``last_apply_npm_results`` into the existing state file.
+
+    State file already carries the periodic-check payload; we tack the
+    apply-time npm summary on as a sibling field so /api/system/updates
+    can surface it. Silent no-op if the file is missing or unreadable.
+    """
+    if not STATE_PATH.exists():
+        return
+    try:
+        data = json.loads(STATE_PATH.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return
+    if not isinstance(data, dict):
+        return
+    data["last_apply_npm_results"] = results
+    try:
+        _atomic_write_json(STATE_PATH, data)
+    except OSError as exc:
+        logger.warning("could not record apply npm results: %s", exc)
+
+
+def _post_apply_update_npm_packages() -> dict[str, Any]:
+    """Refresh globally-installed npm CLIs that install.sh seeded.
+
+    Apply Update only swaps the venv + admin tarball. CLI tools that
+    install.sh dropped via ``npm install -g`` (today: only
+    ``@anthropic-ai/claude-code``) get frozen at install time unless we
+    actively refresh them here. We do *not* touch ``preexisting_npm``:
+    a CLI the user owned before sygen ever ran must keep their version
+    pin even on Apply.
+
+    Errors per-package are logged + recorded; they never abort the apply
+    flow — we already have the new venv mv-swapped in by the time this
+    runs.
+    """
+    results: dict[str, Any] = {
+        "updated": [],
+        "skipped": [],
+        "errors": [],
+        "checked_at": dt.datetime.now(dt.timezone.utc)
+        .isoformat(timespec="seconds")
+        .replace("+00:00", "Z"),
+    }
+    if not INSTALL_MANIFEST.exists():
+        return results
+    try:
+        manifest = json.loads(INSTALL_MANIFEST.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError) as exc:
+        logger.warning("post-apply npm: cannot read manifest: %s", exc)
+        return results
+    if not isinstance(manifest, dict):
+        return results
+    pkgs = manifest.get("installed_npm") or []
+    if not isinstance(pkgs, list) or not pkgs:
+        return results
+
+    npm_bin = shutil.which("npm")
+    if not npm_bin:
+        for pkg in pkgs:
+            if isinstance(pkg, str):
+                results["errors"].append({"pkg": pkg, "error": "npm not found in PATH"})
+        return results
+
+    for pkg in pkgs:
+        if not isinstance(pkg, str) or not pkg:
+            continue
+        try:
+            proc = subprocess.run(
+                [npm_bin, "update", "-g", pkg],
+                capture_output=True,
+                text=True,
+                timeout=120,
+                check=False,
+            )
+        except subprocess.TimeoutExpired as exc:
+            logger.warning("post-apply npm update -g %s timed out", pkg)
+            results["errors"].append({"pkg": pkg, "error": f"timeout: {exc}"})
+            continue
+        except OSError as exc:
+            logger.warning("post-apply npm update -g %s failed: %s", pkg, exc)
+            results["errors"].append({"pkg": pkg, "error": str(exc)})
+            continue
+        if proc.returncode == 0:
+            logger.info("post-apply npm: refreshed %s", pkg)
+            results["updated"].append(pkg)
+        else:
+            stderr = (proc.stderr or proc.stdout or "").strip().splitlines()[-1:]
+            msg = stderr[0] if stderr else f"exit {proc.returncode}"
+            logger.warning("post-apply npm update -g %s failed: %s", pkg, msg)
+            results["errors"].append({"pkg": pkg, "error": msg})
+
+    return results
+
+
 _PYTHON_SHEBANG_RE = re.compile(rb"^#!(\S+/python\d*(?:\.\d+)?)")
 
 
@@ -786,6 +881,16 @@ def _apply_core(version: str) -> None:
     finally:
         _start_service(core_label)
     shutil.rmtree(wheel_path.parent, ignore_errors=True)
+
+    # P0 (1.6.81): refresh globally-installed npm CLIs (claude) that the
+    # mv-swap doesn't touch. Outside the start/stop bracket because npm
+    # never interacts with the running core service. Failures here log
+    # only — the venv swap already succeeded.
+    try:
+        npm_results = _post_apply_update_npm_packages()
+        _record_apply_npm_results(npm_results)
+    except Exception as exc:  # pragma: no cover — defensive belt
+        logger.warning("post-apply npm refresh raised: %s", exc)
 
 
 def _apply_admin(version: str) -> None:

@@ -755,6 +755,55 @@ def _post_apply_update_npm_packages() -> dict[str, Any]:
     return results
 
 
+def _post_apply_warmup_embeddings() -> None:
+    """Warm the fastembed model cache in the new venv.
+
+    After a venv swap the new ``site-packages`` may have a freshly-installed
+    fastembed/onnxruntime that has never imported the model in this process
+    image. Loading it eagerly here means the first user message after Apply
+    doesn't pay the ~5–30 s ONNX cold load (the model cache itself, ~220 MB
+    on disk, persists across venv swaps so the network roundtrip stays one-
+    time at install). Failure is non-fatal — the bot's own ``_warmup_embeddings``
+    background task will retry on the next service restart.
+    """
+    py = VENV_DIR / "bin" / "python"
+    if not py.exists():
+        return
+    cache_dir = SYGEN_HOME / "embeddings" / "model_cache"
+    try:
+        cache_dir.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        logger.warning("post-apply warmup: cannot mkdir %s: %s", cache_dir, exc)
+        return
+    code = (
+        "import sys\n"
+        "from fastembed import TextEmbedding\n"
+        "list(TextEmbedding(model_name=sys.argv[1], cache_dir=sys.argv[2])"
+        ".embed(['warmup']))\n"
+    )
+    try:
+        proc = subprocess.run(
+            [
+                str(py), "-c", code,
+                "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2",
+                str(cache_dir),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=180,
+            check=False,
+        )
+    except (subprocess.SubprocessError, OSError) as exc:
+        logger.warning("post-apply embedding warmup: subprocess failed: %s", exc)
+        return
+    if proc.returncode == 0:
+        logger.info("post-apply embedding warmup: cache ready at %s", cache_dir)
+    else:
+        stderr = (proc.stderr or proc.stdout or "").strip().splitlines()[-1:]
+        msg = stderr[0] if stderr else f"exit {proc.returncode}"
+        logger.warning("post-apply embedding warmup failed: %s", msg)
+
+
 _PYTHON_SHEBANG_RE = re.compile(rb"^#!(\S+/python\d*(?:\.\d+)?)")
 
 
@@ -1218,6 +1267,15 @@ async def _handle_apply(headers: dict[str, str]) -> bytes:
         except Exception as exc:  # pragma: no cover — defensive belt
             logger.warning("post-apply npm refresh raised: %s", exc)
             npm_results = {"updated": [], "skipped": [], "errors": [str(exc)]}
+
+        # P0 (1.6.88): warm the fastembed model cache in the new venv so the
+        # first user message after Apply doesn't stall on a cold ONNX load.
+        # Backgrounded so a slow warmup can't hold the /apply response —
+        # core's own startup warmup will catch up regardless.
+        try:
+            await loop.run_in_executor(None, _post_apply_warmup_embeddings)
+        except Exception as exc:  # pragma: no cover — defensive belt
+            logger.warning("post-apply embedding warmup raised: %s", exc)
 
         # Refresh state so the next /api/system/updates read reflects new pins.
         # run_check() merges with existing state.json (1.6.81), preserving

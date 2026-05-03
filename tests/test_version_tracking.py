@@ -317,5 +317,40 @@ class EnvFilePathRegressionTests(unittest.TestCase):
                 importlib.reload(updater)
 
 
+class EnvPinUpdatesProcessEnvTests(unittest.TestCase):
+    """Regression for v1.6.82: ``_update_env_pin`` must also refresh
+    ``os.environ[key]``. ``_config()`` prefers process env over the .env
+    file, so a long-running updater process kept reading the pre-apply
+    pin even after the file was rewritten — leaving state.json on the
+    old version and the apply banner stuck.
+    """
+
+    def test_env_pin_propagates_to_os_environ(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            env_path = Path(tmp) / ".env"
+            env_path.write_text("SYGEN_CORE_VERSION=1.6.80\n", encoding="utf-8")
+            with (
+                mock.patch.object(updater, "ENV_FILE", env_path),
+                mock.patch.dict(
+                    os.environ,
+                    {"SYGEN_CORE_VERSION": "1.6.80"},
+                    clear=False,
+                ),
+            ):
+                self.assertEqual(os.environ.get("SYGEN_CORE_VERSION"), "1.6.80")
+                updater._update_env_pin("SYGEN_CORE_VERSION", "1.6.81")
+                # File was rewritten.
+                self.assertIn(
+                    "SYGEN_CORE_VERSION=1.6.81",
+                    env_path.read_text(encoding="utf-8"),
+                )
+                # Process env was refreshed too.
+                self.assertEqual(os.environ.get("SYGEN_CORE_VERSION"), "1.6.81")
+                # _config() returns the fresh value (no stale process env).
+                self.assertEqual(
+                    updater._config().get("SYGEN_CORE_VERSION"), "1.6.81"
+                )
+
+
 if __name__ == "__main__":
     unittest.main()

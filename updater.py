@@ -574,6 +574,11 @@ def _update_env_pin(key: str, value: str) -> None:
     """Replace KEY= line in $SYGEN_ROOT/.env (or append if missing).
 
     Atomic write via tmp + os.replace. .env stays 0600.
+
+    Also updates ``os.environ[key]``: ``_config()`` prefers process env over
+    .env file values, so without this the long-running updater process
+    keeps returning the pre-apply version pin to ``run_check()``, leaving
+    state.json stuck on the old version even after a successful swap.
     """
     if not ENV_FILE.exists():
         return
@@ -590,6 +595,7 @@ def _update_env_pin(key: str, value: str) -> None:
     tmp.write_text("\n".join(lines) + "\n", encoding="utf-8")
     os.chmod(tmp, 0o600)
     os.replace(tmp, ENV_FILE)
+    os.environ[key] = value
 
 
 def _update_install_manifest(key: str, value: str) -> None:

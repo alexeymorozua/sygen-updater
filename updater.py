@@ -644,6 +644,38 @@ def _record_apply_npm_results(results: dict[str, Any]) -> None:
         logger.warning("could not record apply npm results: %s", exc)
 
 
+# Map npm package name → CLI binary name. `version.py` in core uses
+# this binary name to key the cli_tools cache. After a successful
+# `npm update -g <pkg>`, we run `<binary> --version` and surface the
+# new version under `binary_versions` so the core API handler can
+# override its (stale) cli_tools cache without waiting for the next
+# weekly probe.
+_NPM_PACKAGE_TO_BINARY: dict[str, str] = {
+    "@anthropic-ai/claude-code": "claude",
+}
+
+
+def _read_binary_version(binary: str) -> str | None:
+    """Return ``<binary> --version`` first whitespace-split token, or None."""
+    bin_path = shutil.which(binary)
+    if not bin_path:
+        return None
+    try:
+        proc = subprocess.run(
+            [bin_path, "--version"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+    except (subprocess.SubprocessError, OSError):
+        return None
+    raw = (proc.stdout or "").strip()
+    if not raw:
+        return None
+    return raw.split()[0] or None
+
+
 def _post_apply_update_npm_packages() -> dict[str, Any]:
     """Refresh globally-installed npm CLIs that install.sh seeded.
 
@@ -662,6 +694,7 @@ def _post_apply_update_npm_packages() -> dict[str, Any]:
         "updated": [],
         "skipped": [],
         "errors": [],
+        "binary_versions": {},
         "checked_at": dt.datetime.now(dt.timezone.utc)
         .isoformat(timespec="seconds")
         .replace("+00:00", "Z"),
@@ -708,6 +741,11 @@ def _post_apply_update_npm_packages() -> dict[str, Any]:
         if proc.returncode == 0:
             logger.info("post-apply npm: refreshed %s", pkg)
             results["updated"].append(pkg)
+            binary = _NPM_PACKAGE_TO_BINARY.get(pkg)
+            if binary:
+                installed = _read_binary_version(binary)
+                if installed:
+                    results["binary_versions"][binary] = installed
         else:
             stderr = (proc.stderr or proc.stdout or "").strip().splitlines()[-1:]
             msg = stderr[0] if stderr else f"exit {proc.returncode}"
@@ -898,16 +936,6 @@ def _apply_core(version: str) -> None:
     finally:
         _start_service(core_label)
     shutil.rmtree(wheel_path.parent, ignore_errors=True)
-
-    # P0 (1.6.81): refresh globally-installed npm CLIs (claude) that the
-    # mv-swap doesn't touch. Outside the start/stop bracket because npm
-    # never interacts with the running core service. Failures here log
-    # only — the venv swap already succeeded.
-    try:
-        npm_results = _post_apply_update_npm_packages()
-        _record_apply_npm_results(npm_results)
-    except Exception as exc:  # pragma: no cover — defensive belt
-        logger.warning("post-apply npm refresh raised: %s", exc)
 
 
 def _apply_admin(version: str) -> None:
@@ -1179,7 +1207,21 @@ async def _handle_apply(headers: dict[str, str]) -> bytes:
         )
         healthy = core_healthy and admin_healthy
 
+        # P0 (1.6.83): refresh globally-installed npm CLIs (claude) regardless
+        # of whether core/admin needed swapping. Banner can be triggered by a
+        # cli_tools-only delta — `_apply_core` is then never called and a
+        # post-hook nested inside it would never fire. The npm refresh has to
+        # live at the top of `_handle_apply` so it always runs.
+        try:
+            npm_results = _post_apply_update_npm_packages()
+            _record_apply_npm_results(npm_results)
+        except Exception as exc:  # pragma: no cover — defensive belt
+            logger.warning("post-apply npm refresh raised: %s", exc)
+            npm_results = {"updated": [], "skipped": [], "errors": [str(exc)]}
+
         # Refresh state so the next /api/system/updates read reflects new pins.
+        # run_check() merges with existing state.json (1.6.81), preserving
+        # last_apply_npm_results we just wrote.
         state_after = await run_check()
         return _http_response(
             200,
@@ -1188,6 +1230,7 @@ async def _handle_apply(headers: dict[str, str]) -> bytes:
                 "applied": applied,
                 "restarted": restarted,
                 "state": state_after,
+                "npm": npm_results,
                 "healthy": healthy,
                 "rolled_back": False,
                 "health": {

@@ -52,10 +52,16 @@ class _NpmHookHarness(unittest.TestCase):
         self.manifest = self.sygen_root / ".install_manifest.json"
         self.state = self.sygen_root / "host_updates" / "_updates.json"
         self.state.parent.mkdir(parents=True, exist_ok=True)
+        # Default: npm is on PATH, but the per-package binary lookup
+        # used by binary_versions returns None (no claude in fixture).
+        # Tests that exercise the version-readback override `which`.
+        def _default_which(name: str) -> str | None:
+            return "/usr/bin/npm" if name == "npm" else None
+
         self._patches = [
             mock.patch.object(updater, "INSTALL_MANIFEST", self.manifest),
             mock.patch.object(updater, "STATE_PATH", self.state),
-            mock.patch.object(updater.shutil, "which", lambda _b: "/usr/bin/npm"),
+            mock.patch.object(updater.shutil, "which", _default_which),
         ]
         for p in self._patches:
             p.start()
@@ -109,6 +115,53 @@ class PostApplyNpmTests(_NpmHookHarness):
             ("/usr/bin/npm", "update", "-g", "typescript"),
             commands,
         )
+
+    def test_binary_versions_recorded_after_successful_update(self) -> None:
+        """After ``npm update -g`` succeeds, the hook should also run
+        ``<binary> --version`` and surface the new version under
+        ``binary_versions`` so the core API can override its stale
+        cli_tools cache without waiting for the weekly probe."""
+        self._write_manifest(
+            installed_npm=["@anthropic-ai/claude-code"],
+            preexisting_npm=[],
+        )
+
+        def _which(name: str) -> str | None:
+            if name == "npm":
+                return "/usr/bin/npm"
+            if name == "claude":
+                return "/usr/local/bin/claude"
+            return None
+
+        def _run(*args, **_kw):
+            argv = args[0]
+            if argv[1:2] == ["update"]:
+                return mock.Mock(returncode=0, stdout="", stderr="")
+            if argv[-1] == "--version":
+                return mock.Mock(returncode=0, stdout="2.1.126 (Claude Code)\n", stderr="")
+            return mock.Mock(returncode=0, stdout="", stderr="")
+
+        with (
+            mock.patch.object(updater.shutil, "which", _which),
+            mock.patch.object(subprocess, "run", side_effect=_run),
+        ):
+            results = updater._post_apply_update_npm_packages()
+
+        self.assertEqual(results["updated"], ["@anthropic-ai/claude-code"])
+        self.assertEqual(results["binary_versions"], {"claude": "2.1.126"})
+
+    def test_binary_versions_omits_when_binary_missing(self) -> None:
+        """If the binary isn't on PATH after npm update (very rare),
+        binary_versions stays empty rather than blocking the apply.
+        """
+        self._write_manifest(
+            installed_npm=["@anthropic-ai/claude-code"],
+            preexisting_npm=[],
+        )
+        with mock.patch.object(subprocess, "run", side_effect=_ok):
+            results = updater._post_apply_update_npm_packages()
+        self.assertEqual(results["updated"], ["@anthropic-ai/claude-code"])
+        self.assertEqual(results["binary_versions"], {})
 
     def test_npm_failure_recorded_but_does_not_raise(self) -> None:
         self._write_manifest(

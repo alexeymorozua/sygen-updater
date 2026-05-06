@@ -3,17 +3,21 @@
 Background: Apply Update mv-swaps the venv + admin tarball but leaves
 globally-installed CLI tools (claude) frozen at install time. install.sh
 records each ``npm install -g`` it ran in
-``$SYGEN_ROOT/.install_manifest.json`` under ``installed_npm`` (the
-``preexisting_npm`` bucket holds CLIs the user already had — those must
-NOT be touched). This module asserts:
+``$SYGEN_ROOT/.install_manifest.json`` under ``installed_npm`` and any
+preexisting installs under ``preexisting_npm``. 1.6.116+: sygen treats
+every CLI it knows about the same way — both buckets get refreshed on
+every Apply. This module asserts:
 
-* Every package in ``installed_npm`` gets one ``npm update -g <pkg>`` call.
-* Packages in ``preexisting_npm`` are never touched.
+* Every package in ``installed_npm`` and ``preexisting_npm`` gets one
+  ``npm update -g <pkg>`` call.
 * npm errors per-package are recorded but do not raise (the apply already
   succeeded by the time the hook runs).
 * Manifest absent / empty / corrupt → silent no-op.
 * ``last_apply_npm_results`` is merged into the existing state file
   without clobbering the periodic-check payload.
+* The deprecated ``force_npm_preexisting`` parameter (1.6.115) is a
+  noop — both ``True`` and the unset default produce identical
+  behaviour.
 """
 
 from __future__ import annotations
@@ -96,24 +100,29 @@ class PostApplyNpmTests(_NpmHookHarness):
         self.assertEqual(results["updated"], ["@anthropic-ai/claude-code"])
         self.assertEqual(results["errors"], [])
 
-    def test_preexisting_npm_is_not_touched(self) -> None:
-        """A CLI the user owned before sygen ran (preexisting_npm) must
-        not get an npm update — that would silently mutate state outside
-        sygen's control. Only the installed_npm bucket is in scope."""
+    def test_preexisting_npm_is_refreshed_by_default(self) -> None:
+        """1.6.116: every CLI sygen tracks gets refreshed on Apply —
+        both ``installed_npm`` and ``preexisting_npm``. The earlier
+        opt-in / opt-out distinction is gone; sygen treats every CLI it
+        knows about the same way (single "Update all" UI button)."""
         self._write_manifest(
             installed_npm=["@anthropic-ai/claude-code"],
             preexisting_npm=["typescript"],
         )
         with mock.patch.object(subprocess, "run", side_effect=_ok) as run:
-            updater._post_apply_update_npm_packages()
+            results = updater._post_apply_update_npm_packages()
         commands = [tuple(c.args[0]) for c in run.call_args_list]
-        self.assertEqual(
+        self.assertIn(
+            ("/usr/bin/npm", "update", "-g", "@anthropic-ai/claude-code"),
             commands,
-            [("/usr/bin/npm", "update", "-g", "@anthropic-ai/claude-code")],
         )
-        self.assertNotIn(
+        self.assertIn(
             ("/usr/bin/npm", "update", "-g", "typescript"),
             commands,
+        )
+        self.assertEqual(
+            sorted(results["updated"]),
+            sorted(["@anthropic-ai/claude-code", "typescript"]),
         )
 
     def test_binary_versions_recorded_after_successful_update(self) -> None:
@@ -233,37 +242,52 @@ class PostApplyNpmTests(_NpmHookHarness):
 
 
 class ForceNpmPreexistingTests(_NpmHookHarness):
-    """1.6.115: opt-in ``force_npm_preexisting=True`` extends the
-    post-apply npm refresh loop to cover ``preexisting_npm`` packages
-    in install_manifest.json — used to drive Claude CLI updates from
-    the Apply Update button when the user explicitly asked for it.
+    """1.6.116: ``force_npm_preexisting`` is a deprecated noop. The
+    post-apply npm refresh always covers both ``installed_npm`` and
+    ``preexisting_npm`` regardless of the flag value (sygen treats
+    every CLI it knows about the same way). These tests pin
+    backwards-compat: 1.6.115 callers passing ``True`` see identical
+    behaviour to callers omitting the flag, and the unified loop is
+    correctly defensive (errors per-package, no double-running, etc.).
     """
 
-    def test_default_false_leaves_preexisting_untouched(self) -> None:
-        """Regression guard: the new flag must default to False so
-        callers without the 1.6.115 update path see exactly the
-        pre-1.6.115 behaviour (preexisting CLIs never bumped).
+    def test_flag_true_and_default_produce_identical_results(self) -> None:
+        """1.6.116: flag value is irrelevant — both ``True`` and the
+        default produce exactly the same set of npm calls. Regression
+        guard against ever re-introducing the gating.
         """
         self._write_manifest(
             installed_npm=["@anthropic-ai/claude-code"],
             preexisting_npm=["typescript"],
         )
-        with mock.patch.object(subprocess, "run", side_effect=_ok) as run:
-            results = updater._post_apply_update_npm_packages()
-        commands = [tuple(c.args[0]) for c in run.call_args_list]
+        with mock.patch.object(subprocess, "run", side_effect=_ok) as run_default:
+            results_default = updater._post_apply_update_npm_packages()
+        with mock.patch.object(subprocess, "run", side_effect=_ok) as run_flag:
+            results_flag = updater._post_apply_update_npm_packages(
+                force_npm_preexisting=True,
+            )
+
+        cmds_default = [tuple(c.args[0]) for c in run_default.call_args_list]
+        cmds_flag = [tuple(c.args[0]) for c in run_flag.call_args_list]
+        self.assertEqual(sorted(cmds_default), sorted(cmds_flag))
         self.assertEqual(
-            commands,
-            [("/usr/bin/npm", "update", "-g", "@anthropic-ai/claude-code")],
+            sorted(results_default["updated"]),
+            sorted(results_flag["updated"]),
         )
-        self.assertNotIn(
+        # Both runs touch both buckets.
+        self.assertIn(
+            ("/usr/bin/npm", "update", "-g", "@anthropic-ai/claude-code"),
+            cmds_default,
+        )
+        self.assertIn(
             ("/usr/bin/npm", "update", "-g", "typescript"),
-            commands,
+            cmds_default,
         )
-        self.assertNotIn("typescript", results["updated"])
 
     def test_flag_true_runs_npm_update_for_preexisting(self) -> None:
         """When the flag is set, every package in ``preexisting_npm``
-        gets one ``npm update -g`` after the installed_npm loop.
+        gets one ``npm update -g`` after the installed_npm loop. Same
+        behaviour as 1.6.115 — pinned to keep backwards-compat sharp.
         """
         self._write_manifest(
             installed_npm=["@anthropic-ai/claude-code"],
@@ -387,7 +411,9 @@ class ForceNpmPreexistingTests(_NpmHookHarness):
         self.assertEqual(results["updated"], ["@anthropic-ai/claude-code"])
 
     def test_empty_preexisting_with_flag_true_no_op(self) -> None:
-        """Empty preexisting_npm with the flag set is a silent no-op."""
+        """Empty preexisting_npm with the flag set is a silent no-op
+        on that bucket — only ``installed_npm`` packages are touched.
+        """
         self._write_manifest(
             installed_npm=["@anthropic-ai/claude-code"],
             preexisting_npm=[],

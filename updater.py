@@ -677,26 +677,30 @@ def _read_binary_version(binary: str) -> str | None:
 
 
 def _post_apply_update_npm_packages(force_npm_preexisting: bool = False) -> dict[str, Any]:
-    """Refresh globally-installed npm CLIs that install.sh seeded.
+    """Refresh globally-installed npm CLIs sygen tracks.
 
     Apply Update only swaps the venv + admin tarball. CLI tools that
     install.sh dropped via ``npm install -g`` (today: only
     ``@anthropic-ai/claude-code``) get frozen at install time unless we
     actively refresh them here.
 
-    By default ``preexisting_npm`` is left alone — a CLI the user owned
-    before sygen ever ran must keep their version pin even on Apply.
-    When ``force_npm_preexisting=True`` (1.6.115+ opt-in via the /apply
-    request body), the same ``npm update -g`` loop also runs over the
-    preexisting bucket so a UI checkbox can drive Claude CLI / etc.
-    refreshes from the same Apply button. A failure on any single
-    preexisting package is recorded in ``errors[]`` and does **not**
-    abort the apply or skip remaining packages.
+    1.6.116+: every package the manifest records — both
+    ``installed_npm`` (sygen-provisioned) and ``preexisting_npm``
+    (user-owned, recorded by install.sh) — gets refreshed on every
+    Apply. Sygen treats every CLI it knows about the same way; the
+    earlier installed-vs-preexisting distinction is gone.
+
+    ``force_npm_preexisting`` is a deprecated noop kept for backwards
+    compatibility with 1.6.115 callers. Both ``True`` and ``False``
+    produce identical behaviour now (both buckets refreshed). The
+    parameter is preserved so nothing in the call chain has to grow a
+    version-aware adapter.
 
     Errors per-package are logged + recorded; they never abort the apply
     flow — we already have the new venv mv-swapped in by the time this
     runs.
     """
+    del force_npm_preexisting  # 1.6.116: deprecated noop, kept for compat.
     results: dict[str, Any] = {
         "updated": [],
         "skipped": [],
@@ -718,14 +722,12 @@ def _post_apply_update_npm_packages(force_npm_preexisting: bool = False) -> dict
 
     installed = manifest.get("installed_npm") or []
     installed = [p for p in installed if isinstance(p, str) and p]
-    preexisting: list[str] = []
-    if force_npm_preexisting:
-        raw_pre = manifest.get("preexisting_npm") or []
-        preexisting = [p for p in raw_pre if isinstance(p, str) and p]
-        # Avoid touching the same package twice if it ended up in both
-        # buckets (shouldn't happen, but be defensive — duplicates would
-        # also double-count in updated[]/binary_versions).
-        preexisting = [p for p in preexisting if p not in installed]
+    raw_pre = manifest.get("preexisting_npm") or []
+    preexisting = [p for p in raw_pre if isinstance(p, str) and p]
+    # Avoid touching the same package twice if it ended up in both
+    # buckets (shouldn't happen, but be defensive — duplicates would
+    # also double-count in updated[]/binary_versions).
+    preexisting = [p for p in preexisting if p not in installed]
 
     pkgs: list[tuple[str, bool]] = [(p, False) for p in installed] + [
         (p, True) for p in preexisting
@@ -1187,12 +1189,13 @@ async def _handle_check(headers: dict[str, str]) -> bytes:
 def _parse_apply_body(body: bytes) -> dict[str, Any]:
     """Parse the optional /apply request body.
 
-    1.6.115+: callers may pass ``{"force_npm_preexisting": true}`` to
+    1.6.115: callers may pass ``{"force_npm_preexisting": true}`` to
     opt the post-apply npm refresh into also bumping packages from
     ``preexisting_npm`` (user-owned CLIs install.sh detected but did
-    not install). An empty / missing / invalid body is treated as the
-    default ``{}`` — the historical pre-1.6.115 behaviour where
-    preexisting CLIs are never touched.
+    not install). 1.6.116+: that flag is a deprecated noop — sygen now
+    always refreshes both buckets. The body is still parsed verbatim so
+    1.6.115 clients keep working unchanged. An empty / missing /
+    invalid body is treated as the default ``{}``.
     """
     if not body:
         return {}

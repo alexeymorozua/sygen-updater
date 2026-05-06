@@ -676,15 +676,22 @@ def _read_binary_version(binary: str) -> str | None:
     return raw.split()[0] or None
 
 
-def _post_apply_update_npm_packages() -> dict[str, Any]:
+def _post_apply_update_npm_packages(force_npm_preexisting: bool = False) -> dict[str, Any]:
     """Refresh globally-installed npm CLIs that install.sh seeded.
 
     Apply Update only swaps the venv + admin tarball. CLI tools that
     install.sh dropped via ``npm install -g`` (today: only
     ``@anthropic-ai/claude-code``) get frozen at install time unless we
-    actively refresh them here. We do *not* touch ``preexisting_npm``:
-    a CLI the user owned before sygen ever ran must keep their version
-    pin even on Apply.
+    actively refresh them here.
+
+    By default ``preexisting_npm`` is left alone — a CLI the user owned
+    before sygen ever ran must keep their version pin even on Apply.
+    When ``force_npm_preexisting=True`` (1.6.115+ opt-in via the /apply
+    request body), the same ``npm update -g`` loop also runs over the
+    preexisting bucket so a UI checkbox can drive Claude CLI / etc.
+    refreshes from the same Apply button. A failure on any single
+    preexisting package is recorded in ``errors[]`` and does **not**
+    abort the apply or skip remaining packages.
 
     Errors per-package are logged + recorded; they never abort the apply
     flow — we already have the new venv mv-swapped in by the time this
@@ -708,20 +715,31 @@ def _post_apply_update_npm_packages() -> dict[str, Any]:
         return results
     if not isinstance(manifest, dict):
         return results
-    pkgs = manifest.get("installed_npm") or []
-    if not isinstance(pkgs, list) or not pkgs:
+
+    installed = manifest.get("installed_npm") or []
+    installed = [p for p in installed if isinstance(p, str) and p]
+    preexisting: list[str] = []
+    if force_npm_preexisting:
+        raw_pre = manifest.get("preexisting_npm") or []
+        preexisting = [p for p in raw_pre if isinstance(p, str) and p]
+        # Avoid touching the same package twice if it ended up in both
+        # buckets (shouldn't happen, but be defensive — duplicates would
+        # also double-count in updated[]/binary_versions).
+        preexisting = [p for p in preexisting if p not in installed]
+
+    pkgs: list[tuple[str, bool]] = [(p, False) for p in installed] + [
+        (p, True) for p in preexisting
+    ]
+    if not pkgs:
         return results
 
     npm_bin = shutil.which("npm")
     if not npm_bin:
-        for pkg in pkgs:
-            if isinstance(pkg, str):
-                results["errors"].append({"pkg": pkg, "error": "npm not found in PATH"})
+        for pkg, _is_pre in pkgs:
+            results["errors"].append({"pkg": pkg, "error": "npm not found in PATH"})
         return results
 
-    for pkg in pkgs:
-        if not isinstance(pkg, str) or not pkg:
-            continue
+    for pkg, is_preexisting in pkgs:
         try:
             proc = subprocess.run(
                 [npm_bin, "update", "-g", pkg],
@@ -732,25 +750,38 @@ def _post_apply_update_npm_packages() -> dict[str, Any]:
             )
         except subprocess.TimeoutExpired as exc:
             logger.warning("post-apply npm update -g %s timed out", pkg)
-            results["errors"].append({"pkg": pkg, "error": f"timeout: {exc}"})
+            err: dict[str, Any] = {"pkg": pkg, "error": f"timeout: {exc}"}
+            if is_preexisting:
+                err["preexisting"] = True
+            results["errors"].append(err)
             continue
         except OSError as exc:
             logger.warning("post-apply npm update -g %s failed: %s", pkg, exc)
-            results["errors"].append({"pkg": pkg, "error": str(exc)})
+            err = {"pkg": pkg, "error": str(exc)}
+            if is_preexisting:
+                err["preexisting"] = True
+            results["errors"].append(err)
             continue
         if proc.returncode == 0:
-            logger.info("post-apply npm: refreshed %s", pkg)
+            logger.info(
+                "post-apply npm: refreshed %s%s",
+                pkg,
+                " (preexisting opt-in)" if is_preexisting else "",
+            )
             results["updated"].append(pkg)
             binary = _NPM_PACKAGE_TO_BINARY.get(pkg)
             if binary:
-                installed = _read_binary_version(binary)
-                if installed:
-                    results["binary_versions"][binary] = installed
+                bin_version = _read_binary_version(binary)
+                if bin_version:
+                    results["binary_versions"][binary] = bin_version
         else:
             stderr = (proc.stderr or proc.stdout or "").strip().splitlines()[-1:]
             msg = stderr[0] if stderr else f"exit {proc.returncode}"
             logger.warning("post-apply npm update -g %s failed: %s", pkg, msg)
-            results["errors"].append({"pkg": pkg, "error": msg})
+            err = {"pkg": pkg, "error": msg}
+            if is_preexisting:
+                err["preexisting"] = True
+            results["errors"].append(err)
 
     return results
 
@@ -1153,7 +1184,28 @@ async def _handle_check(headers: dict[str, str]) -> bytes:
     return _http_response(200, {"ok": True, "data": data})
 
 
-async def _handle_apply(headers: dict[str, str]) -> bytes:
+def _parse_apply_body(body: bytes) -> dict[str, Any]:
+    """Parse the optional /apply request body.
+
+    1.6.115+: callers may pass ``{"force_npm_preexisting": true}`` to
+    opt the post-apply npm refresh into also bumping packages from
+    ``preexisting_npm`` (user-owned CLIs install.sh detected but did
+    not install). An empty / missing / invalid body is treated as the
+    default ``{}`` — the historical pre-1.6.115 behaviour where
+    preexisting CLIs are never touched.
+    """
+    if not body:
+        return {}
+    try:
+        parsed = json.loads(body.decode("utf-8"))
+    except (json.JSONDecodeError, ValueError, UnicodeDecodeError):
+        return {}
+    if not isinstance(parsed, dict):
+        return {}
+    return parsed
+
+
+async def _handle_apply(headers: dict[str, str], body: bytes = b"") -> bytes:
     global _last_apply_at
 
     if not _auth_ok(headers):
@@ -1161,6 +1213,9 @@ async def _handle_apply(headers: dict[str, str]) -> bytes:
     cfg = _config()
     if not cfg.get("SYGEN_UPDATER_TOKEN"):
         return _http_response(503, {"ok": False, "error": "updater token not configured"})
+
+    parsed_body = _parse_apply_body(body)
+    force_npm_preexisting = bool(parsed_body.get("force_npm_preexisting", False))
 
     async with _apply_lock:
         loop = asyncio.get_event_loop()
@@ -1262,7 +1317,9 @@ async def _handle_apply(headers: dict[str, str]) -> bytes:
         # post-hook nested inside it would never fire. The npm refresh has to
         # live at the top of `_handle_apply` so it always runs.
         try:
-            npm_results = _post_apply_update_npm_packages()
+            npm_results = _post_apply_update_npm_packages(
+                force_npm_preexisting=force_npm_preexisting,
+            )
             _record_apply_npm_results(npm_results)
         except Exception as exc:  # pragma: no cover — defensive belt
             logger.warning("post-apply npm refresh raised: %s", exc)
@@ -1301,7 +1358,7 @@ async def _handle_apply(headers: dict[str, str]) -> bytes:
 
 async def _serve(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
     try:
-        method, path, headers, _body = await _read_request(reader)
+        method, path, headers, body = await _read_request(reader)
     except _RequestTooLarge as exc:
         try:
             writer.write(
@@ -1325,7 +1382,7 @@ async def _serve(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> 
         elif method == "POST" and path == "/check":
             resp = await _handle_check(headers)
         elif method == "POST" and path == "/apply":
-            resp = await _handle_apply(headers)
+            resp = await _handle_apply(headers, body)
         else:
             resp = _http_response(404, {"ok": False, "error": "not found"})
         writer.write(resp)

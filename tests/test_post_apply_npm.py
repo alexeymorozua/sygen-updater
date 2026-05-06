@@ -232,6 +232,207 @@ class PostApplyNpmTests(_NpmHookHarness):
         self.assertIn("npm not found", results["errors"][0]["error"])
 
 
+class ForceNpmPreexistingTests(_NpmHookHarness):
+    """1.6.115: opt-in ``force_npm_preexisting=True`` extends the
+    post-apply npm refresh loop to cover ``preexisting_npm`` packages
+    in install_manifest.json — used to drive Claude CLI updates from
+    the Apply Update button when the user explicitly asked for it.
+    """
+
+    def test_default_false_leaves_preexisting_untouched(self) -> None:
+        """Regression guard: the new flag must default to False so
+        callers without the 1.6.115 update path see exactly the
+        pre-1.6.115 behaviour (preexisting CLIs never bumped).
+        """
+        self._write_manifest(
+            installed_npm=["@anthropic-ai/claude-code"],
+            preexisting_npm=["typescript"],
+        )
+        with mock.patch.object(subprocess, "run", side_effect=_ok) as run:
+            results = updater._post_apply_update_npm_packages()
+        commands = [tuple(c.args[0]) for c in run.call_args_list]
+        self.assertEqual(
+            commands,
+            [("/usr/bin/npm", "update", "-g", "@anthropic-ai/claude-code")],
+        )
+        self.assertNotIn(
+            ("/usr/bin/npm", "update", "-g", "typescript"),
+            commands,
+        )
+        self.assertNotIn("typescript", results["updated"])
+
+    def test_flag_true_runs_npm_update_for_preexisting(self) -> None:
+        """When the flag is set, every package in ``preexisting_npm``
+        gets one ``npm update -g`` after the installed_npm loop.
+        """
+        self._write_manifest(
+            installed_npm=["@anthropic-ai/claude-code"],
+            preexisting_npm=["typescript", "@vercel/some-cli"],
+        )
+        with mock.patch.object(subprocess, "run", side_effect=_ok) as run:
+            results = updater._post_apply_update_npm_packages(
+                force_npm_preexisting=True,
+            )
+        commands = [tuple(c.args[0]) for c in run.call_args_list]
+        self.assertIn(
+            ("/usr/bin/npm", "update", "-g", "@anthropic-ai/claude-code"),
+            commands,
+        )
+        self.assertIn(
+            ("/usr/bin/npm", "update", "-g", "typescript"),
+            commands,
+        )
+        self.assertIn(
+            ("/usr/bin/npm", "update", "-g", "@vercel/some-cli"),
+            commands,
+        )
+        # Both preexisting packages also land in updated[].
+        self.assertEqual(
+            sorted(results["updated"]),
+            sorted([
+                "@anthropic-ai/claude-code",
+                "typescript",
+                "@vercel/some-cli",
+            ]),
+        )
+
+    def test_preexisting_failure_recorded_but_does_not_skip_others(self) -> None:
+        """A single preexisting npm failure must be recorded with
+        ``preexisting=True`` and NOT abort the loop — remaining
+        packages still get refreshed (graceful per-package).
+        """
+        self._write_manifest(
+            installed_npm=["@anthropic-ai/claude-code"],
+            preexisting_npm=["broken-pkg", "ok-pkg"],
+        )
+
+        def _run(*args, **_kw):
+            argv = args[0]
+            pkg = argv[-1]
+            if pkg == "broken-pkg":
+                return mock.Mock(returncode=1, stdout="",
+                                  stderr="EACCES: permission denied")
+            return mock.Mock(returncode=0, stdout="", stderr="")
+
+        with mock.patch.object(subprocess, "run", side_effect=_run):
+            results = updater._post_apply_update_npm_packages(
+                force_npm_preexisting=True,
+            )
+
+        # ok-pkg + installed pkg succeeded.
+        self.assertIn("ok-pkg", results["updated"])
+        self.assertIn("@anthropic-ai/claude-code", results["updated"])
+        # broken-pkg recorded as an error with preexisting marker.
+        broken_errors = [e for e in results["errors"] if e["pkg"] == "broken-pkg"]
+        self.assertEqual(len(broken_errors), 1)
+        self.assertIn("EACCES", broken_errors[0]["error"])
+        self.assertTrue(broken_errors[0].get("preexisting"))
+
+    def test_flag_true_records_binary_versions_for_preexisting(self) -> None:
+        """Successful preexisting refresh records ``binary_versions``
+        the same way installed_npm does — so the core override
+        mechanism clears the banner regardless of bucket.
+        """
+        self._write_manifest(
+            installed_npm=[],
+            preexisting_npm=["@anthropic-ai/claude-code"],
+        )
+
+        def _which(name: str) -> str | None:
+            if name == "npm":
+                return "/usr/bin/npm"
+            if name == "claude":
+                return "/usr/local/bin/claude"
+            return None
+
+        def _run(*args, **_kw):
+            argv = args[0]
+            if argv[1:2] == ["update"]:
+                return mock.Mock(returncode=0, stdout="", stderr="")
+            if argv[-1] == "--version":
+                return mock.Mock(returncode=0, stdout="2.1.129 (Claude Code)\n", stderr="")
+            return mock.Mock(returncode=0, stdout="", stderr="")
+
+        with (
+            mock.patch.object(updater.shutil, "which", _which),
+            mock.patch.object(subprocess, "run", side_effect=_run),
+        ):
+            results = updater._post_apply_update_npm_packages(
+                force_npm_preexisting=True,
+            )
+
+        self.assertEqual(results["updated"], ["@anthropic-ai/claude-code"])
+        self.assertEqual(results["binary_versions"], {"claude": "2.1.129"})
+
+    def test_duplicate_in_both_buckets_runs_only_once(self) -> None:
+        """Defensive: if a package somehow ends up in both
+        installed_npm and preexisting_npm, we should not double-run
+        npm update on it (would double-count in updated[]).
+        """
+        self._write_manifest(
+            installed_npm=["@anthropic-ai/claude-code"],
+            preexisting_npm=["@anthropic-ai/claude-code"],
+        )
+        with mock.patch.object(subprocess, "run", side_effect=_ok) as run:
+            results = updater._post_apply_update_npm_packages(
+                force_npm_preexisting=True,
+            )
+        commands = [tuple(c.args[0]) for c in run.call_args_list]
+        # Single npm update call, not two.
+        npm_update_calls = [
+            c for c in commands
+            if c[:3] == ("/usr/bin/npm", "update", "-g")
+        ]
+        self.assertEqual(len(npm_update_calls), 1)
+        self.assertEqual(results["updated"], ["@anthropic-ai/claude-code"])
+
+    def test_empty_preexisting_with_flag_true_no_op(self) -> None:
+        """Empty preexisting_npm with the flag set is a silent no-op."""
+        self._write_manifest(
+            installed_npm=["@anthropic-ai/claude-code"],
+            preexisting_npm=[],
+        )
+        with mock.patch.object(subprocess, "run", side_effect=_ok) as run:
+            results = updater._post_apply_update_npm_packages(
+                force_npm_preexisting=True,
+            )
+        commands = [tuple(c.args[0]) for c in run.call_args_list]
+        # Only the one installed_npm package was touched.
+        self.assertEqual(
+            commands,
+            [("/usr/bin/npm", "update", "-g", "@anthropic-ai/claude-code")],
+        )
+        self.assertEqual(results["updated"], ["@anthropic-ai/claude-code"])
+
+
+class ParseApplyBodyTests(unittest.TestCase):
+    """1.6.115: /apply now accepts an optional JSON body. Empty / invalid
+    body → empty dict (default behaviour preserved)."""
+
+    def test_empty_body_returns_empty_dict(self) -> None:
+        self.assertEqual(updater._parse_apply_body(b""), {})
+
+    def test_well_formed_dict_returned_verbatim(self) -> None:
+        body = b'{"force_npm_preexisting": true}'
+        self.assertEqual(
+            updater._parse_apply_body(body),
+            {"force_npm_preexisting": True},
+        )
+
+    def test_malformed_json_returns_empty_dict(self) -> None:
+        self.assertEqual(updater._parse_apply_body(b"{not json"), {})
+
+    def test_non_dict_returns_empty_dict(self) -> None:
+        # Top-level array → not a dict → ignored.
+        self.assertEqual(updater._parse_apply_body(b"[1,2,3]"), {})
+        # Top-level scalar → not a dict → ignored.
+        self.assertEqual(updater._parse_apply_body(b'"hello"'), {})
+
+    def test_non_utf8_returns_empty_dict(self) -> None:
+        # Latin-1 byte that isn't valid UTF-8 → graceful empty dict.
+        self.assertEqual(updater._parse_apply_body(b"\xff\xfe"), {})
+
+
 class RecordApplyNpmResultsTests(_NpmHookHarness):
     def test_merges_into_existing_state_without_clobber(self) -> None:
         self._write_state(

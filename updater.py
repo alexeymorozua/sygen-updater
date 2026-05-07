@@ -909,6 +909,14 @@ _CORE_LABEL_DARWIN = "pro.sygen.core"
 _CORE_LABEL_LINUX = "sygen-core"
 _ADMIN_LABEL_DARWIN = "pro.sygen.admin"
 _ADMIN_LABEL_LINUX = "sygen-admin"
+_UPDATER_LABEL_DARWIN = "pro.sygen.updater"
+_UPDATER_LABEL_LINUX = "sygen-updater"
+
+# 1.6.125: short delay before the self-restart kickstart fires, so the
+# in-flight /apply HTTP response has time to flush + the TCP socket can
+# close cleanly before launchd / systemd SIGTERMs us. 1s is well above
+# round-trip on loopback.
+_SELF_RESTART_DELAY_SECONDS = 1
 
 
 def _service_label(role: str) -> str:
@@ -916,6 +924,71 @@ def _service_label(role: str) -> str:
     if role == "core":
         return _CORE_LABEL_DARWIN if platform.system() == "Darwin" else _CORE_LABEL_LINUX
     return _ADMIN_LABEL_DARWIN if platform.system() == "Darwin" else _ADMIN_LABEL_LINUX
+
+
+def _schedule_self_restart() -> bool:
+    """Spawn a detached helper that restarts this updater process.
+
+    1.6.125: ``_apply_core`` installs the freshly downloaded
+    ``sygen_updater`` wheel into the new venv, but the running updater
+    process keeps executing whatever module image it loaded at startup.
+    Any updater-side fix (e.g. the 1.6.116 npm-bucket unification) was
+    therefore dead code on the host until a manual ``launchctl kickstart``
+    or reboot. This scheduler closes that gap automatically: after a
+    successful ``/apply`` the updater asks launchd / systemd to restart
+    it. ``KeepAlive`` (Darwin) / ``Restart=always`` (Linux) bring it back
+    immediately on the freshly installed wheel.
+
+    Detached via ``start_new_session=True`` and a short ``sleep`` so the
+    in-flight HTTP response has time to flush before launchd SIGTERMs
+    us. Failure is non-fatal — we log and return ``False`` so the apply
+    flow itself never fails because of the self-restart.
+
+    Returns ``True`` when the helper was spawned, ``False`` on platform
+    mismatch or spawn failure.
+    """
+    if platform.system() == "Darwin":
+        target = f"gui/{os.getuid()}/{_UPDATER_LABEL_DARWIN}"
+        # ``exec`` so the kickstart inherits the helper's pid — keeps
+        # the process tree clean if anything in the env logs ``ps`` for
+        # debugging.
+        cmd = [
+            "sh",
+            "-c",
+            f"sleep {_SELF_RESTART_DELAY_SECONDS}; "
+            f"exec launchctl kickstart -k {target}",
+        ]
+    elif platform.system() == "Linux":
+        cmd = [
+            "sh",
+            "-c",
+            f"sleep {_SELF_RESTART_DELAY_SECONDS}; "
+            f"exec systemctl restart {_UPDATER_LABEL_LINUX}",
+        ]
+    else:
+        logger.info(
+            "self-restart: unsupported platform %s — skipping",
+            platform.system(),
+        )
+        return False
+    try:
+        subprocess.Popen(  # noqa: S603 — fixed argv, no shell injection surface
+            cmd,
+            start_new_session=True,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            close_fds=True,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        logger.warning("self-restart: could not spawn helper: %s", exc)
+        return False
+    logger.info(
+        "self-restart: scheduled (delay=%ss, label=%s)",
+        _SELF_RESTART_DELAY_SECONDS,
+        _UPDATER_LABEL_DARWIN if platform.system() == "Darwin" else _UPDATER_LABEL_LINUX,
+    )
+    return True
 
 
 def _apply_core(version: str) -> None:
@@ -1341,6 +1414,18 @@ async def _handle_apply(headers: dict[str, str], body: bytes = b"") -> bytes:
         # run_check() merges with existing state.json (1.6.81), preserving
         # last_apply_npm_results we just wrote.
         state_after = await run_check()
+
+        # 1.6.125: schedule a detached self-restart so the next Apply
+        # picks up any updater-side code changes that just landed in the
+        # new venv. Pre-1.6.125 the updater process kept executing its
+        # in-memory module image forever, leaving updater-side fixes
+        # dormant until a manual ``launchctl kickstart``. Always fires
+        # on the success path (matches the existing belt-and-suspenders
+        # core+admin restart above); never fires on the failure paths
+        # (rate-limit / version-resolve / timeout / apply-failure
+        # branches all return earlier).
+        self_restart_scheduled = _schedule_self_restart()
+
         return _http_response(
             200,
             {
@@ -1355,6 +1440,7 @@ async def _handle_apply(headers: dict[str, str], body: bytes = b"") -> bytes:
                     "core": {"healthy": core_healthy, "last_code": core_code, "last_error": core_err},
                     "admin": {"healthy": admin_healthy, "last_code": admin_code, "last_error": admin_err},
                 },
+                "self_restart_scheduled": self_restart_scheduled,
             },
         )
 

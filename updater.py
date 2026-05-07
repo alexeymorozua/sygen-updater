@@ -936,8 +936,10 @@ def _schedule_self_restart() -> bool:
     therefore dead code on the host until a manual ``launchctl kickstart``
     or reboot. This scheduler closes that gap automatically: after a
     successful ``/apply`` the updater asks launchd / systemd to restart
-    it. ``KeepAlive`` (Darwin) / ``Restart=always`` (Linux) bring it back
-    immediately on the freshly installed wheel.
+    it. ``launchctl kickstart -k`` (Darwin, with ``KeepAlive=true`` in the
+    plist) and ``systemctl restart`` (Linux, with ``Restart=on-failure``
+    in the unit) both perform a clean stop+start cycle, so the policy
+    differences don't matter for the restart itself.
 
     Detached via ``start_new_session=True`` and a short ``sleep`` so the
     in-flight HTTP response has time to flush before launchd SIGTERMs

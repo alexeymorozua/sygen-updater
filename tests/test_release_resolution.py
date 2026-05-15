@@ -1,10 +1,10 @@
 """Unit tests for the GitHub Releases resolution layer.
 
 These cover the v1.6.76 rewrite that switched the updater from polling the
-private source repos (with ``v<version>`` tags) to polling the public
-``alexeymorozua/sygen-releases`` mirror with prefixed tags
-(``core-<version>``, ``admin-<version>``). Legacy v-tag mode is still
-reachable via ``SYGEN_RELEASES_GITHUB_REPO=''`` and is tested too.
+private source repo (with ``v<version>`` tags) to polling the public
+``alexeymorozua/sygen-releases`` mirror with the ``core-<version>`` prefix.
+Legacy v-tag mode is still reachable via ``SYGEN_RELEASES_GITHUB_REPO=''``
+and is tested too.
 
 No network access — every GitHub API call is monkey-patched.
 """
@@ -49,16 +49,14 @@ class FetchLatestFromMirrorTests(unittest.TestCase):
     """Mirror-mode polling: filter by prefix, pick highest semver."""
 
     def _fake_releases(self) -> list[dict[str, Any]]:
-        # Mixed payload: both components, draft + prerelease entries that
-        # must be skipped, and a non-prefixed tag that's none of our
-        # business. Ordered randomly to confirm we sort by semver, not by
-        # GitHub's created_at.
+        # Mixed payload: draft + prerelease entries that must be skipped,
+        # and a non-prefixed tag that's none of our business. Ordered
+        # randomly to confirm we sort by semver, not by GitHub's
+        # created_at.
         return [
             {"tag_name": "core-1.6.74", "draft": False, "prerelease": False},
-            {"tag_name": "admin-0.5.55", "draft": False, "prerelease": False},
             {"tag_name": "core-1.10.0", "draft": False, "prerelease": False},
             {"tag_name": "core-1.6.75", "draft": False, "prerelease": False},
-            {"tag_name": "admin-0.5.54", "draft": False, "prerelease": False},
             # Skipped:
             {"tag_name": "core-1.99.0", "draft": True, "prerelease": False},
             {"tag_name": "core-2.0.0-rc1", "draft": False, "prerelease": True},
@@ -72,14 +70,6 @@ class FetchLatestFromMirrorTests(unittest.TestCase):
             self.assertEqual(
                 updater.fetch_latest_from_mirror("alexeymorozua/sygen-releases", "core-"),
                 "1.10.0",  # numeric, not lex
-            )
-
-    def test_picks_highest_admin_semver(self):
-        releases = self._fake_releases()
-        with mock.patch.object(updater, "_http_get_json", return_value=releases):
-            self.assertEqual(
-                updater.fetch_latest_from_mirror("alexeymorozua/sygen-releases", "admin-"),
-                "0.5.55",
             )
 
     def test_skips_drafts_and_prereleases(self):
@@ -158,12 +148,6 @@ class FetchLatestForTests(unittest.TestCase):
             m_legacy.assert_called_once_with("alexeymorozua/sygen")
             m_mirror.assert_not_called()
 
-    def test_legacy_mode_admin_uses_admin_source_repo(self):
-        cfg = {"SYGEN_RELEASES_GITHUB_REPO": ""}
-        with mock.patch.object(updater, "fetch_latest_version", return_value="0.5.55") as m_legacy:
-            self.assertEqual(updater.fetch_latest_for(cfg, "admin"), "0.5.55")
-            m_legacy.assert_called_once_with("alexeymorozua/sygen-admin")
-
     def test_legacy_mode_honors_custom_source_repo_override(self):
         cfg = {
             "SYGEN_RELEASES_GITHUB_REPO": "",
@@ -184,15 +168,6 @@ class ReleaseAssetUrlTests(unittest.TestCase):
             url,
             "https://github.com/alexeymorozua/sygen-releases/releases/download/"
             "core-1.6.75/sygen-1.6.75-py3-none-any.whl",
-        )
-
-    def test_mirror_admin_tarball(self):
-        cfg = {}
-        url = updater._release_asset_url("admin", "0.5.55", "sygen-admin-0.5.55.tar.gz", cfg)
-        self.assertEqual(
-            url,
-            "https://github.com/alexeymorozua/sygen-releases/releases/download/"
-            "admin-0.5.55/sygen-admin-0.5.55.tar.gz",
         )
 
     def test_mirror_updater_wheel(self):
@@ -217,15 +192,6 @@ class ReleaseAssetUrlTests(unittest.TestCase):
             "v1.6.75/sygen-1.6.75-py3-none-any.whl",
         )
 
-    def test_legacy_admin_tarball(self):
-        cfg = {"SYGEN_RELEASES_GITHUB_REPO": ""}
-        url = updater._release_asset_url("admin", "0.5.55", "sygen-admin-0.5.55.tar.gz", cfg)
-        self.assertEqual(
-            url,
-            "https://github.com/alexeymorozua/sygen-admin/releases/download/"
-            "v0.5.55/sygen-admin-0.5.55.tar.gz",
-        )
-
     def test_custom_mirror_repo(self):
         cfg = {"SYGEN_RELEASES_GITHUB_REPO": "fork/mirror"}
         url = updater._release_asset_url("core", "1.6.75", "sygen-1.6.75-py3-none-any.whl", cfg)
@@ -237,17 +203,15 @@ class ReleaseAssetUrlTests(unittest.TestCase):
 
 
 class PayloadRepoTests(unittest.TestCase):
-    """``_payload_repo`` decides which repo string the admin UI sees."""
+    """``_payload_repo`` decides which repo string clients see."""
 
     def test_mirror_mode_surfaces_mirror_repo(self):
         cfg = {}
         self.assertEqual(updater._payload_repo(cfg, "core"), "alexeymorozua/sygen-releases")
-        self.assertEqual(updater._payload_repo(cfg, "admin"), "alexeymorozua/sygen-releases")
 
     def test_legacy_mode_surfaces_source_repo(self):
         cfg = {"SYGEN_RELEASES_GITHUB_REPO": ""}
         self.assertEqual(updater._payload_repo(cfg, "core"), "alexeymorozua/sygen")
-        self.assertEqual(updater._payload_repo(cfg, "admin"), "alexeymorozua/sygen-admin")
 
 
 if __name__ == "__main__":

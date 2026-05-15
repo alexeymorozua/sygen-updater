@@ -1,30 +1,33 @@
 """Sygen updater (native install).
 
-Polls GitHub Releases for new sygen / sygen-admin tags and exposes a
-local HTTP endpoint that core's /apply flow calls to swap in a new
-venv + admin tarball atomically.
+Polls GitHub Releases for new sygen tags and exposes a local HTTP
+endpoint that core's /apply flow calls to swap in a new venv
+atomically.
+
+1.6.198: admin web was removed from the install pipeline. The updater
+no longer fetches, applies, or restarts the admin service — only core
+is tracked.
 
 Architecture:
 
 1. Every ``CHECK_INTERVAL`` seconds, query the GitHub Releases API and
-   resolve the latest available core and admin versions:
+   resolve the latest available core version:
 
    * **Mirror mode (default)** — query ``repos/<releases_repo>/releases``
      once, filter by ``tag_name`` prefix (``core-`` for sygen+sygen-updater
-     wheels, ``admin-`` for the sygen-admin tarball), pick the highest
-     numeric semver. ``releases_repo`` defaults to
-     ``alexeymorozua/sygen-releases``: a public repo that auto-mirrors
-     release artefacts from the private source repos so anonymous curl
+     wheels), pick the highest numeric semver. ``releases_repo`` defaults
+     to ``alexeymorozua/sygen-releases``: a public repo that auto-mirrors
+     release artefacts from the private source repo so anonymous curl
      can reach them. Override via ``SYGEN_RELEASES_GITHUB_REPO``.
    * **Legacy mode** — set ``SYGEN_RELEASES_GITHUB_REPO=`` (empty) to
      fall back to ``repos/<source>/releases/latest`` against the private
-     source repos with ``v<version>`` tags. Only useful when running
+     source repo with ``v<version>`` tags. Only useful when running
      against a fork that hasn't adopted the public mirror layout.
 
-   The result is compared against the versions pinned in
-   ``$SYGEN_HOME/.env`` (``SYGEN_CORE_VERSION`` / ``SYGEN_ADMIN_VERSION``)
-   and written atomically to ``$SYGEN_HOME/host_updates/_updates.json``
-   — core reads it back via ``GET /api/system/updates``.
+   The result is compared against the version pinned in
+   ``$SYGEN_HOME/.env`` (``SYGEN_CORE_VERSION``) and written atomically
+   to ``$SYGEN_HOME/host_updates/_updates.json`` — core reads it back
+   via ``GET /api/system/updates``.
 
 2. Expose ``GET /health`` (unauthenticated, used by smoke tests).
 
@@ -33,11 +36,9 @@ Architecture:
      - download the new wheel from the GitHub Release
      - create a new venv at ``$VENV_NEW_DIR`` and ``pip install`` the wheel
      - mv-swap: ``venv → venv-prev``, ``venv-new → venv``
-     - download the admin tarball, extract to ``$ADMIN_NEW_DIR``
-     - mv-swap: ``admin → admin-prev``, ``admin-new → admin``
-     - update ``.env`` with the new version pins
-     - kick the core + admin services (launchctl on macOS, systemctl on
-       Linux) so the new code is running
+     - update ``.env`` with the new version pin
+     - kick the core service (launchctl on macOS, systemctl on Linux)
+       so the new code is running
 
 The updater itself is NOT swapped during an apply — that would kill the
 in-flight request. ``sygen-updater`` ships from the same wheel as
@@ -102,7 +103,6 @@ STATE_PATH = Path(
     os.environ.get("STATE_PATH", str(SYGEN_HOME / "host_updates" / "_updates.json"))
 )
 VENV_DIR = Path(os.environ.get("SYGEN_VENV_DIR", str(SYGEN_HOME / "venv")))
-ADMIN_DIR = Path(os.environ.get("SYGEN_ADMIN_DIR", str(SYGEN_HOME / "admin")))
 LISTEN_HOST = os.environ.get("SYGEN_UPDATER_HOST", "127.0.0.1")
 LISTEN_PORT = int(os.environ.get("SYGEN_UPDATER_PORT", "8082"))
 CHECK_INTERVAL = int(os.environ.get("CHECK_INTERVAL", "1800"))
@@ -131,10 +131,8 @@ def _config() -> dict[str, str]:
     cfg = _load_env_file(ENV_FILE)
     for k in (
         "SYGEN_CORE_VERSION",
-        "SYGEN_ADMIN_VERSION",
         "SYGEN_UPDATER_TOKEN",
         "SYGEN_CORE_GITHUB_REPO",
-        "SYGEN_ADMIN_GITHUB_REPO",
         "SYGEN_RELEASES_GITHUB_REPO",
         # P0-3: pinned by install.sh so the updater seeds new venvs with
         # the same brew/apt python the live venv was built with.
@@ -150,14 +148,13 @@ def _config() -> dict[str, str]:
 
 _DEFAULT_RELEASES_REPO = "alexeymorozua/sygen-releases"
 _DEFAULT_CORE_REPO = "alexeymorozua/sygen"
-_DEFAULT_ADMIN_REPO = "alexeymorozua/sygen-admin"
 
 
 def _releases_repo(cfg: dict[str, str]) -> str:
     """Return the public mirror repo to poll, or empty string for legacy mode.
 
     The key may be absent (→ default mirror) or explicitly empty (→ legacy
-    v-tag mode against the private source repos).
+    v-tag mode against the private source repo).
     """
     if "SYGEN_RELEASES_GITHUB_REPO" not in cfg:
         return _DEFAULT_RELEASES_REPO
@@ -165,9 +162,8 @@ def _releases_repo(cfg: dict[str, str]) -> str:
 
 
 def _legacy_source_repo(cfg: dict[str, str], component: str) -> str:
-    if component == "core":
-        return cfg.get("SYGEN_CORE_GITHUB_REPO", _DEFAULT_CORE_REPO)
-    return cfg.get("SYGEN_ADMIN_GITHUB_REPO", _DEFAULT_ADMIN_REPO)
+    del component  # only "core" is supported since 1.6.198 — admin removed
+    return cfg.get("SYGEN_CORE_GITHUB_REPO", _DEFAULT_CORE_REPO)
 
 
 # Per-process apply lock + rate limit. The /apply call is destructive and
@@ -240,7 +236,7 @@ def _parse_semver(s: str) -> Optional[tuple[int, ...]]:
 
 def fetch_latest_from_mirror(releases_repo: str, prefix: str) -> Optional[str]:
     """Mirror mode: list releases of ``releases_repo``, filter by tag prefix
-    (``core-`` or ``admin-``), return the highest numeric semver.
+    (``core-``), return the highest numeric semver.
 
     Skips draft and pre-release entries. Pulls a single page of 100 — the
     mirror auto-prunes old artefacts so the latest is always near the top.
@@ -272,8 +268,8 @@ def fetch_latest_from_mirror(releases_repo: str, prefix: str) -> Optional[str]:
 
 
 def fetch_latest_for(cfg: dict[str, str], component: str) -> Optional[str]:
-    """Resolve the latest available version of ``component`` (``core`` or
-    ``admin``) honoring mirror vs legacy mode.
+    """Resolve the latest available version of ``component`` (only ``core``
+    is supported since 1.6.198) honoring mirror vs legacy mode.
     """
     releases_repo = _releases_repo(cfg)
     if releases_repo:
@@ -282,7 +278,7 @@ def fetch_latest_for(cfg: dict[str, str], component: str) -> Optional[str]:
 
 
 def _payload_repo(cfg: dict[str, str], component: str) -> str:
-    """Repo string surfaced to the admin UI for the "where did this version
+    """Repo string surfaced to clients for the "where did this version
     come from" link. Mirror in mirror mode, source in legacy mode.
     """
     releases_repo = _releases_repo(cfg)
@@ -314,13 +310,9 @@ async def run_check() -> dict[str, Any]:
 
     cfg = _config()
     core_current = cfg.get("SYGEN_CORE_VERSION", "")
-    admin_current = cfg.get("SYGEN_ADMIN_VERSION", "")
 
     loop = asyncio.get_event_loop()
-    core_latest, admin_latest = await asyncio.gather(
-        loop.run_in_executor(None, fetch_latest_for, cfg, "core"),
-        loop.run_in_executor(None, fetch_latest_for, cfg, "admin"),
-    )
+    core_latest = await loop.run_in_executor(None, fetch_latest_for, cfg, "core")
 
     now = dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds").replace(
         "+00:00", "Z"
@@ -338,17 +330,6 @@ async def run_check() -> dict[str, Any]:
             ),
             "error": None if core_latest else "github releases api error",
         },
-        "admin": {
-            "repo": _payload_repo(cfg, "admin"),
-            "current": admin_current,
-            "latest": admin_latest,
-            "version": admin_current,
-            "latest_version": admin_latest,
-            "update_available": bool(
-                admin_latest and admin_current and admin_latest != admin_current
-            ),
-            "error": None if admin_latest else "github releases api error",
-        },
     }
 
     existing: dict[str, Any] = {}
@@ -357,6 +338,10 @@ async def run_check() -> dict[str, Any]:
             loaded = json.loads(STATE_PATH.read_text(encoding="utf-8"))
             if isinstance(loaded, dict):
                 existing = loaded
+                # 1.6.198: scrub legacy admin block from older state files
+                # so the response never resurrects admin UI on clients
+                # that still recognize the key.
+                existing.pop("admin", None)
         except (json.JSONDecodeError, OSError):
             existing = {}
     merged = {**existing, **payload}
@@ -382,7 +367,7 @@ async def periodic_checker() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Apply: atomic venv + admin swap
+# Apply: atomic venv swap
 # ---------------------------------------------------------------------------
 
 
@@ -431,9 +416,9 @@ def _download_verified(asset_url: str, dest: Path, timeout: float = 600.0) -> No
     matching ``<asset>.sha256`` sidecar.
 
     Sidecar format (matches sha256sum -c): ``<hex>  <basename>``. Missing
-    sidecar = fail closed (raises RuntimeError). The release workflows in
-    sygen + sygen-admin emit these sidecars; absence means the release
-    was published incorrectly and we refuse to install.
+    sidecar = fail closed (raises RuntimeError). The sygen release
+    workflow emits these sidecars; absence means the release was
+    published incorrectly and we refuse to install.
     """
     _download(asset_url, dest, timeout=timeout)
     sha_url = asset_url + ".sha256"
@@ -679,7 +664,7 @@ def _read_binary_version(binary: str) -> str | None:
 def _post_apply_update_npm_packages(force_npm_preexisting: bool = False) -> dict[str, Any]:
     """Refresh globally-installed npm CLIs sygen tracks.
 
-    Apply Update only swaps the venv + admin tarball. CLI tools that
+    Apply Update only swaps the venv. CLI tools that
     install.sh dropped via ``npm install -g`` (today: only
     ``@anthropic-ai/claude-code``) get frozen at install time unless we
     actively refresh them here.
@@ -907,8 +892,6 @@ def _rewrite_venv_shebangs(venv_dir: Path) -> None:
 
 _CORE_LABEL_DARWIN = "pro.sygen.core"
 _CORE_LABEL_LINUX = "sygen-core"
-_ADMIN_LABEL_DARWIN = "pro.sygen.admin"
-_ADMIN_LABEL_LINUX = "sygen-admin"
 _UPDATER_LABEL_DARWIN = "pro.sygen.updater"
 _UPDATER_LABEL_LINUX = "sygen-updater"
 
@@ -920,10 +903,10 @@ _SELF_RESTART_DELAY_SECONDS = 1
 
 
 def _service_label(role: str) -> str:
-    """``role`` is ``core`` or ``admin``. Returns the platform-specific label."""
-    if role == "core":
-        return _CORE_LABEL_DARWIN if platform.system() == "Darwin" else _CORE_LABEL_LINUX
-    return _ADMIN_LABEL_DARWIN if platform.system() == "Darwin" else _ADMIN_LABEL_LINUX
+    """Returns the platform-specific service label. Only ``core`` is
+    supported since 1.6.198."""
+    del role  # only "core" exists now — admin removed
+    return _CORE_LABEL_DARWIN if platform.system() == "Darwin" else _CORE_LABEL_LINUX
 
 
 def _schedule_self_restart() -> bool:
@@ -1095,59 +1078,6 @@ def _apply_core(version: str) -> None:
     shutil.rmtree(wheel_path.parent, ignore_errors=True)
 
 
-def _apply_admin(version: str) -> None:
-    """Download admin tarball (SHA256-verified), extract, mv-swap.
-
-    Same stop/start bracketing as ``_apply_core`` — the empty-$ADMIN_DIR
-    window between the two ``rename()`` calls would otherwise let
-    KeepAlive respawn ``node $ADMIN_DIR/server.js`` against ENOENT.
-    """
-    cfg = _config()
-    tarball_name = f"sygen-admin-{version}.tar.gz"
-    tarball_url = _release_asset_url("admin", version, tarball_name, cfg)
-    tmp_root = Path(tempfile.mkdtemp(prefix="sygen-admin-"))
-    tarball_path = tmp_root / tarball_name
-    logger.info("downloading + verifying admin tarball %s", tarball_url)
-    _download_verified(tarball_url, tarball_path)
-
-    staging = ADMIN_DIR.with_name("admin-new")
-    admin_prev = ADMIN_DIR.with_name("admin-prev")
-    if staging.exists():
-        shutil.rmtree(staging)
-    staging.mkdir(parents=True, exist_ok=True)
-    subprocess.run(
-        ["tar", "-xzf", str(tarball_path), "-C", str(staging)],
-        check=True,
-        timeout=300,
-    )
-    if not (staging / "server.js").exists():
-        raise RuntimeError("admin tarball missing server.js — refusing to swap in")
-
-    admin_label = _service_label("admin")
-    _stop_service(admin_label)
-    try:
-        if admin_prev.exists():
-            shutil.rmtree(admin_prev)
-        renamed_away = False
-        if ADMIN_DIR.exists():
-            ADMIN_DIR.rename(admin_prev)
-            renamed_away = True
-        try:
-            staging.rename(ADMIN_DIR)
-        except OSError:
-            if renamed_away and admin_prev.exists():
-                admin_prev.rename(ADMIN_DIR)
-            raise
-        # P0 (1.6.79): persist the new version BEFORE start_service so /check
-        # reflects the swap on the very next poll. Done inside the try-block
-        # so a failed rename leaves the pins on the previous version.
-        _update_env_pin("SYGEN_ADMIN_VERSION", version)
-        _update_install_manifest("admin_version", version)
-    finally:
-        _start_service(admin_label)
-    shutil.rmtree(tmp_root, ignore_errors=True)
-
-
 # ---------------------------------------------------------------------------
 # HTTP server (stdlib aiohttp-free — keeps the venv tiny)
 # ---------------------------------------------------------------------------
@@ -1249,7 +1179,6 @@ async def _handle_health() -> bytes:
             "last_error": _last_check_error,
             "check_interval": CHECK_INTERVAL,
             "venv_dir": str(VENV_DIR),
-            "admin_dir": str(ADMIN_DIR),
         },
     )
 
@@ -1307,22 +1236,19 @@ async def _handle_apply(headers: dict[str, str], body: bytes = b"") -> bytes:
             )
         _last_apply_at = now
 
-        # Fetch latest release versions for both core and admin (mirror-aware).
+        # Fetch latest core release version (mirror-aware).
         core_latest = await loop.run_in_executor(None, fetch_latest_for, cfg, "core")
-        admin_latest = await loop.run_in_executor(None, fetch_latest_for, cfg, "admin")
-        if not core_latest or not admin_latest:
+        if not core_latest:
             return _http_response(
                 500,
                 {
                     "ok": False,
-                    "error": "could not resolve latest versions from GitHub Releases",
+                    "error": "could not resolve latest core version from GitHub Releases",
                     "core_latest": core_latest,
-                    "admin_latest": admin_latest,
                 },
             )
 
         core_current = cfg.get("SYGEN_CORE_VERSION", "")
-        admin_current = cfg.get("SYGEN_ADMIN_VERSION", "")
         applied: list[str] = []
 
         try:
@@ -1336,14 +1262,6 @@ async def _handle_apply(headers: dict[str, str], body: bytes = b"") -> bytes:
                     timeout=APPLY_TIMEOUT,
                 )
                 applied.append(f"core {core_current} → {core_latest}")
-
-            if admin_latest != admin_current:
-                logger.info("applying admin %s → %s", admin_current, admin_latest)
-                await asyncio.wait_for(
-                    loop.run_in_executor(None, _apply_admin, admin_latest),
-                    timeout=APPLY_TIMEOUT,
-                )
-                applied.append(f"admin {admin_current} → {admin_latest}")
         except asyncio.TimeoutError:
             return _http_response(
                 504,
@@ -1356,41 +1274,33 @@ async def _handle_apply(headers: dict[str, str], body: bytes = b"") -> bytes:
                 {"ok": False, "error": f"apply failed: {exc}", "applied": applied},
             )
 
-        # Restart core + admin so the swap takes effect. Updater stays
-        # alive (we're inside it). _apply_* already stop+start the affected
+        # Restart core so the swap takes effect. Updater stays alive
+        # (we're inside it). _apply_core already stops+starts the
         # service to bracket the mv-swap (P1-6); the kickstart here is
         # belt-and-suspenders so a no-op _apply (e.g. version unchanged
         # but operator forced /apply) still picks up new env or .plist.
         restarted: list[dict[str, Any]] = []
-        for label, unit in (
-            ("pro.sygen.core", "sygen-core"),
-            ("pro.sygen.admin", "sygen-admin"),
-        ):
-            try:
-                rc, msg = _restart_service(
-                    label if platform.system() == "Darwin" else unit
-                )
-                restarted.append({"target": label if platform.system() == "Darwin" else unit, "rc": rc, "msg": msg})
-            except (subprocess.SubprocessError, OSError) as exc:
-                restarted.append({"target": label, "rc": -1, "msg": str(exc)})
+        label = "pro.sygen.core"
+        unit = "sygen-core"
+        target = label if platform.system() == "Darwin" else unit
+        try:
+            rc, msg = _restart_service(target)
+            restarted.append({"target": target, "rc": rc, "msg": msg})
+        except (subprocess.SubprocessError, OSError) as exc:
+            restarted.append({"target": target, "rc": -1, "msg": str(exc)})
 
-        # P1-9: health poll. After kicking the services, give them up to
-        # 30s to answer. We don't auto-rollback yet (architectural follow-
-        # up for v1.7.1) — just report ``healthy=false`` so the admin UI
-        # can surface the failure and the operator can decide.
-        admin_port = cfg.get("SYGEN_ADMIN_PORT", os.environ.get("SYGEN_ADMIN_PORT", "8080"))
+        # P1-9: health poll. After kicking the core service, give it up
+        # to 30s to answer. We don't auto-rollback yet (architectural
+        # follow-up for v1.7.1) — just report ``healthy=false`` so
+        # clients can surface the failure and the operator can decide.
         core_url = "http://127.0.0.1:8081/api/system/status"
-        admin_url = f"http://127.0.0.1:{admin_port}/"
         core_healthy, core_code, core_err = await loop.run_in_executor(
             None, _poll_health, core_url, 30.0
         )
-        admin_healthy, admin_code, admin_err = await loop.run_in_executor(
-            None, _poll_health, admin_url, 30.0
-        )
-        healthy = core_healthy and admin_healthy
+        healthy = core_healthy
 
         # P0 (1.6.83): refresh globally-installed npm CLIs (claude) regardless
-        # of whether core/admin needed swapping. Banner can be triggered by a
+        # of whether core needed swapping. Banner can be triggered by a
         # cli_tools-only delta — `_apply_core` is then never called and a
         # post-hook nested inside it would never fire. The npm refresh has to
         # live at the top of `_handle_apply` so it always runs.
@@ -1423,7 +1333,7 @@ async def _handle_apply(headers: dict[str, str], body: bytes = b"") -> bytes:
         # in-memory module image forever, leaving updater-side fixes
         # dormant until a manual ``launchctl kickstart``. Always fires
         # on the success path (matches the existing belt-and-suspenders
-        # core+admin restart above); never fires on the failure paths
+        # core restart above); never fires on the failure paths
         # (rate-limit / version-resolve / timeout / apply-failure
         # branches all return earlier).
         self_restart_scheduled = _schedule_self_restart()
@@ -1440,7 +1350,6 @@ async def _handle_apply(headers: dict[str, str], body: bytes = b"") -> bytes:
                 "rolled_back": False,
                 "health": {
                     "core": {"healthy": core_healthy, "last_code": core_code, "last_error": core_err},
-                    "admin": {"healthy": admin_healthy, "last_code": admin_code, "last_error": admin_err},
                 },
                 "self_restart_scheduled": self_restart_scheduled,
             },
@@ -1496,8 +1405,8 @@ async def _serve(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> 
 def _enforce_loopback_bind() -> None:
     """Refuse to expose /apply beyond loopback unless the operator opts in.
 
-    /apply is bearer-authed but executes a privileged venv/admin swap that
-    restarts core+admin. A misconfigured ``SYGEN_UPDATER_HOST=0.0.0.0`` (or
+    /apply is bearer-authed but executes a privileged venv swap that
+    restarts core. A misconfigured ``SYGEN_UPDATER_HOST=0.0.0.0`` (or
     a LAN address) silently turns it into a remote-controllable kill switch
     on the local network. Default 127.0.0.1 is fine; anything else needs
     explicit ``SYGEN_UPDATER_ALLOW_REMOTE=1`` to acknowledge the risk.
@@ -1527,14 +1436,12 @@ def _warn_on_non_default_repos() -> None:
     if not releases_repo:
         # Legacy mode opted in explicitly.
         core_repo = _legacy_source_repo(cfg, "core")
-        admin_repo = _legacy_source_repo(cfg, "admin")
         logger.warning(
             "Updater in LEGACY mode (SYGEN_RELEASES_GITHUB_REPO=''): polling "
-            "private source repos directly via /releases/latest with v-tags. "
-            "core=%s admin=%s. Anonymous curl can't reach private repos — "
+            "private source repo directly via /releases/latest with v-tags. "
+            "core=%s. Anonymous curl can't reach private repos — "
             "set GH_TOKEN or switch back to mirror mode.",
             core_repo,
-            admin_repo,
         )
         return
     if releases_repo != _DEFAULT_RELEASES_REPO:

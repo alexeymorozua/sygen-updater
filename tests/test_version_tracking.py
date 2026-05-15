@@ -1,20 +1,19 @@
 """Tests for on-disk version tracking after Apply Update (P0/P1 in v1.6.79).
 
 Background: pre-1.6.79 the ``_handle_apply`` handler called
-``_update_env_pin`` *after* ``_apply_core`` / ``_apply_admin`` returned,
-and ``$SYGEN_ROOT/.install_manifest.json`` was never refreshed at all.
-Symptom: after a successful Apply Update the admin banner kept showing
+``_update_env_pin`` *after* ``_apply_core`` returned, and
+``$SYGEN_ROOT/.install_manifest.json`` was never refreshed at all.
+Symptom: after a successful Apply Update the banner kept showing
 "update available" because the next ``/check`` read the stale pin back
-from ``$SYGEN_HOME/.env``. Fix moves the pin write inside
-``_apply_core`` / ``_apply_admin``, just after the rollback window
-closes (post-shebang-rewrite / post-rename), and adds a new
-``_update_install_manifest`` helper that touches the manifest install.sh
-seeded.
+from ``$SYGEN_HOME/.env``. Fix moves the pin write inside ``_apply_core``,
+just after the rollback window closes (post-shebang-rewrite / post-rename),
+and adds a new ``_update_install_manifest`` helper that touches the
+manifest install.sh seeded.
 
 These tests stub out the heavy parts of an apply (download, venv build,
 service start/stop) and assert just the version-tracking behaviour:
 
-* On a successful core/admin swap, the .env pin AND manifest are updated.
+* On a successful core swap, the .env pin AND manifest are updated.
 * If the swap rolls back mid-apply (subprocess fail, shebang-rewrite
   fail), the pin stays on the previous version.
 * ``_update_install_manifest`` is idempotent and silent-no-ops on a
@@ -52,23 +51,13 @@ def _fake_venv_create(cmd, *args, **kwargs):
     if isinstance(cmd, (list, tuple)) and "-m" in cmd and "venv" in cmd:
         venv_dir = Path(cmd[-1])
         (venv_dir / "bin").mkdir(parents=True, exist_ok=True)
-    elif isinstance(cmd, (list, tuple)) and cmd and cmd[0] == "tar":
-        # ``tar -xzf <tarball> -C <staging>`` — drop the server.js
-        # marker into the staging dir so _apply_admin's existence check
-        # passes.
-        try:
-            staging = Path(cmd[cmd.index("-C") + 1])
-        except (ValueError, IndexError):
-            staging = None
-        if staging is not None:
-            (staging / "server.js").write_text("// fake admin\n", encoding="utf-8")
     return mock.Mock(returncode=0, stdout="", stderr="")
 
 
 class _ApplyHarness(unittest.TestCase):
     """Shared scaffolding: temp SYGEN_HOME with .env + manifest, mocked
     download / subprocess / service hooks. Subclasses run ``_apply_core``
-    or ``_apply_admin`` against the patched module constants.
+    against the patched module constants.
     """
 
     def setUp(self) -> None:
@@ -82,7 +71,6 @@ class _ApplyHarness(unittest.TestCase):
         self.env_file = self.sygen_root / ".env"
         self.env_file.write_text(
             "SYGEN_CORE_VERSION=1.6.78\n"
-            "SYGEN_ADMIN_VERSION=0.5.55\n"
             "SYGEN_UPDATER_TOKEN=test-token\n",
             encoding="utf-8",
         )
@@ -92,7 +80,6 @@ class _ApplyHarness(unittest.TestCase):
             json.dumps(
                 {
                     "core_version": "1.6.78",
-                    "admin_version": "0.5.55",
                     "install_root": str(self.sygen_root),
                 },
                 indent=2,
@@ -103,8 +90,6 @@ class _ApplyHarness(unittest.TestCase):
         self.venv_dir = self.sygen_home / "venv"
         self.venv_dir.mkdir()
         (self.venv_dir / "bin").mkdir()
-        self.admin_dir = self.sygen_home / "admin"
-        self.admin_dir.mkdir()
 
         # Patch module-level constants so the helper functions read/write
         # against our temp tree.
@@ -114,7 +99,6 @@ class _ApplyHarness(unittest.TestCase):
             mock.patch.object(updater, "SYGEN_HOME", self.sygen_home),
             mock.patch.object(updater, "SYGEN_ROOT", self.sygen_root),
             mock.patch.object(updater, "VENV_DIR", self.venv_dir),
-            mock.patch.object(updater, "ADMIN_DIR", self.admin_dir),
             mock.patch.object(updater, "_download_verified", lambda *a, **kw: None),
             mock.patch.object(updater, "_stop_service", lambda *a, **kw: None),
             mock.patch.object(updater, "_start_service", lambda *a, **kw: (0, "")),
@@ -145,14 +129,12 @@ class ApplyCoreVersionTrackingTests(_ApplyHarness):
         updater._apply_core("1.6.79")
         self.assertEqual(self._read_env_pin("SYGEN_CORE_VERSION"), "1.6.79")
         # Other keys must survive untouched.
-        self.assertEqual(self._read_env_pin("SYGEN_ADMIN_VERSION"), "0.5.55")
         self.assertEqual(self._read_env_pin("SYGEN_UPDATER_TOKEN"), "test-token")
 
     def test_manifest_core_version_updated_after_successful_swap(self) -> None:
         updater._apply_core("1.6.79")
         self.assertEqual(self._read_manifest_field("core_version"), "1.6.79")
-        # Sibling fields (e.g. admin_version, install_root) survive.
-        self.assertEqual(self._read_manifest_field("admin_version"), "0.5.55")
+        # Sibling fields (e.g. install_root) survive.
         self.assertEqual(self._read_manifest_field("install_root"), str(self.sygen_root))
 
     def test_pins_unchanged_when_subprocess_fails_mid_apply(self) -> None:
@@ -182,30 +164,6 @@ class ApplyCoreVersionTrackingTests(_ApplyHarness):
                 updater._apply_core("1.6.79")
         self.assertEqual(self._read_env_pin("SYGEN_CORE_VERSION"), "1.6.78")
         self.assertEqual(self._read_manifest_field("core_version"), "1.6.78")
-
-
-class ApplyAdminVersionTrackingTests(_ApplyHarness):
-    def test_env_pin_updated_after_successful_swap(self) -> None:
-        updater._apply_admin("0.5.56")
-        self.assertEqual(self._read_env_pin("SYGEN_ADMIN_VERSION"), "0.5.56")
-        self.assertEqual(self._read_env_pin("SYGEN_CORE_VERSION"), "1.6.78")
-
-    def test_manifest_admin_version_updated_after_successful_swap(self) -> None:
-        updater._apply_admin("0.5.56")
-        self.assertEqual(self._read_manifest_field("admin_version"), "0.5.56")
-        self.assertEqual(self._read_manifest_field("core_version"), "1.6.78")
-
-    def test_pins_unchanged_when_tar_extract_fails(self) -> None:
-        def tar_boom(cmd, *args, **kwargs):
-            if isinstance(cmd, (list, tuple)) and cmd and cmd[0] == "tar":
-                raise subprocess.CalledProcessError(returncode=1, cmd=cmd)
-            return _fake_venv_create(cmd, *args, **kwargs)
-
-        with mock.patch.object(subprocess, "run", side_effect=tar_boom):
-            with self.assertRaises(subprocess.CalledProcessError):
-                updater._apply_admin("0.5.56")
-        self.assertEqual(self._read_env_pin("SYGEN_ADMIN_VERSION"), "0.5.55")
-        self.assertEqual(self._read_manifest_field("admin_version"), "0.5.55")
 
 
 class UpdateInstallManifestTests(unittest.TestCase):
@@ -254,10 +212,10 @@ class UpdateInstallManifestTests(unittest.TestCase):
             json.dumps({"core_version": "1.6.78"}, indent=2) + "\n",
             encoding="utf-8",
         )
-        updater._update_install_manifest("admin_version", "0.5.56")
+        updater._update_install_manifest("install_root", "/srv/sygen")
         data = json.loads(self.manifest.read_text(encoding="utf-8"))
         self.assertEqual(data["core_version"], "1.6.78")
-        self.assertEqual(data["admin_version"], "0.5.56")
+        self.assertEqual(data["install_root"], "/srv/sygen")
 
     def test_corrupt_manifest_silent_no_op(self) -> None:
         # A half-written manifest must not crash the apply flow — leave it
@@ -287,7 +245,7 @@ class EnvFilePathRegressionTests(unittest.TestCase):
     (one level deeper). Pre-1.6.80 the constant was ``SYGEN_HOME / .env``,
     which on every native install pointed at ``/srv/sygen/data/.env`` —
     a path install.sh never creates — so ``_update_env_pin`` silently
-    no-op'd and the admin update banner stayed lit after Apply Update.
+    no-op'd and the update banner stayed lit after Apply Update.
 
     Verifies the constant by reloading ``updater`` under a controlled
     environment, instead of mocking ``ENV_FILE`` directly (which would

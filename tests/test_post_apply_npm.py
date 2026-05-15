@@ -1,7 +1,7 @@
 """Tests for the post-apply npm refresh hook (P0 in v1.6.81).
 
-Background: Apply Update mv-swaps the venv + admin tarball but leaves
-globally-installed CLI tools (claude) frozen at install time. install.sh
+Background: Apply Update mv-swaps the venv but leaves globally-installed
+CLI tools (claude) frozen at install time. install.sh
 records each ``npm install -g`` it ran in
 ``$SYGEN_ROOT/.install_manifest.json`` under ``installed_npm`` and any
 preexisting installs under ``preexisting_npm``. 1.6.116+: sygen treats
@@ -465,7 +465,6 @@ class RecordApplyNpmResultsTests(_NpmHookHarness):
             {
                 "checked_at": "2026-05-03T00:00:00Z",
                 "core": {"current": "1.6.80", "latest": "1.6.81"},
-                "admin": {"current": "0.5.57", "latest": "0.5.57"},
             }
         )
         updater._record_apply_npm_results(
@@ -502,7 +501,6 @@ class RunCheckPreservesApplyResultsTests(_NpmHookHarness):
             {
                 "checked_at": "2026-05-03T00:00:00Z",
                 "core": {"current": "1.6.80"},
-                "admin": {"current": "0.5.57"},
                 "last_apply_npm_results": {
                     "updated": ["@anthropic-ai/claude-code"],
                     "skipped": [],
@@ -514,7 +512,6 @@ class RunCheckPreservesApplyResultsTests(_NpmHookHarness):
         with (
             mock.patch.object(updater, "_config", return_value={
                 "SYGEN_CORE_VERSION": "1.6.81",
-                "SYGEN_ADMIN_VERSION": "0.5.58",
             }),
             mock.patch.object(updater, "fetch_latest_for", return_value="1.6.81"),
         ):
@@ -540,7 +537,6 @@ class RunCheckPreservesApplyResultsTests(_NpmHookHarness):
         with (
             mock.patch.object(updater, "_config", return_value={
                 "SYGEN_CORE_VERSION": "1.6.81",
-                "SYGEN_ADMIN_VERSION": "0.5.58",
             }),
             mock.patch.object(updater, "fetch_latest_for", return_value="1.6.81"),
         ):

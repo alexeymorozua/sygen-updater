@@ -82,8 +82,8 @@ class ScheduleSelfRestartTests(unittest.TestCase):
         self.assertEqual(argv[1], "-c")
         self.assertIn("sleep", argv[2])
         # Linux uses system-level systemctl — install.sh seeds
-        # sygen-updater.service as a system unit (matches sygen-core /
-        # sygen-admin), not a --user unit.
+        # sygen-updater.service as a system unit (matches sygen-core),
+        # not a --user unit.
         self.assertIn("systemctl restart sygen-updater", argv[2])
         self.assertNotIn("--user", argv[2])
         self.assertTrue(popen.call_args.kwargs.get("start_new_session"))
@@ -128,11 +128,10 @@ class ScheduleSelfRestartTests(unittest.TestCase):
 class _ApplyHarness(unittest.TestCase):
     """Drive ``_handle_apply`` end-to-end with the heavy parts stubbed.
 
-    Apply is a coroutine that calls ``run_check`` + ``_apply_core`` /
-    ``_apply_admin`` + ``_post_apply_update_npm_packages`` + a
-    health poll. We stub every one of those so the test focuses on
-    *whether* ``_schedule_self_restart`` was called and on what code
-    path.
+    Apply is a coroutine that calls ``run_check`` + ``_apply_core`` +
+    ``_post_apply_update_npm_packages`` + a health poll. We stub every
+    one of those so the test focuses on *whether*
+    ``_schedule_self_restart`` was called and on what code path.
     """
 
     BEARER = "test-token"
@@ -145,12 +144,9 @@ class _ApplyHarness(unittest.TestCase):
                 return_value={
                     "SYGEN_UPDATER_TOKEN": self.BEARER,
                     "SYGEN_CORE_VERSION": "1.6.124",
-                    "SYGEN_ADMIN_VERSION": "0.5.99",
-                    "SYGEN_ADMIN_PORT": "8080",
                 },
             ),
             mock.patch.object(updater, "_apply_core"),
-            mock.patch.object(updater, "_apply_admin"),
             mock.patch.object(
                 updater,
                 "_restart_service",
@@ -199,12 +195,11 @@ class _ApplyHarness(unittest.TestCase):
     def _resolve_versions(
         self,
         core: str | None = "1.6.125",
-        admin: str | None = "0.5.99",
     ) -> mock.MagicMock:
         return mock.patch.object(
             updater,
             "fetch_latest_for",
-            side_effect=lambda _cfg, component: core if component == "core" else admin,
+            side_effect=lambda _cfg, _component: core,
         )
 
 
@@ -227,11 +222,11 @@ class HandleApplySelfRestartTests(_ApplyHarness):
 
     def test_no_op_apply_still_schedules(self) -> None:
         """Even when nothing was applied (versions match), we still
-        schedule. Matches the existing belt-and-suspenders core+admin
+        schedule. Matches the existing belt-and-suspenders core
         kickstart for forced no-op applies.
         """
         with (
-            self._resolve_versions(core="1.6.124", admin="0.5.99"),
+            self._resolve_versions(core="1.6.124"),
             mock.patch.object(
                 updater, "_schedule_self_restart", return_value=True,
             ) as sched,
@@ -264,7 +259,7 @@ class HandleApplySelfRestartTests(_ApplyHarness):
 
     def test_version_resolve_failure_does_not_schedule(self) -> None:
         with (
-            self._resolve_versions(core=None, admin="0.5.99"),
+            self._resolve_versions(core=None),
             mock.patch.object(
                 updater, "_schedule_self_restart", return_value=True,
             ) as sched,

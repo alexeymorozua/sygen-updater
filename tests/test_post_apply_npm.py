@@ -431,6 +431,248 @@ class ForceNpmPreexistingTests(_NpmHookHarness):
         self.assertEqual(results["updated"], ["@anthropic-ai/claude-code"])
 
 
+class MultiProviderNpmTests(_NpmHookHarness):
+    """Subtask #12: sygen-core supports Claude, Gemini and Codex CLIs as
+    alternate auth providers. The updater must refresh every installed
+    multi-provider CLI on Apply — not only Claude — so iOS/admin clients
+    see fresh ``current`` values for all three without waiting for the
+    weekly probe.
+
+    Two refresh paths are exercised:
+
+    * Manifest path: install.sh (subtask #11) records gemini/codex in
+      ``installed_npm`` → existing loop already handles them.
+    * Known-extra path: installs that predate subtask #11 won't have
+      gemini/codex in the manifest. The "known multi-provider CLI"
+      fallback refreshes them anyway, gated on ``shutil.which(binary)``
+      so we never *install* a CLI the user didn't ask for.
+    """
+
+    def test_gemini_cli_update_success(self) -> None:
+        """Gemini in installed_npm gets refreshed and binary version is
+        surfaced under ``binary_versions['gemini']`` for the core API
+        override mechanism."""
+        self._write_manifest(
+            installed_npm=["@google/gemini-cli"],
+            preexisting_npm=[],
+        )
+
+        def _which(name: str) -> str | None:
+            if name == "npm":
+                return "/usr/bin/npm"
+            if name == "gemini":
+                return "/usr/local/bin/gemini"
+            return None
+
+        def _run(*args, **_kw):
+            argv = args[0]
+            if argv[1:2] == ["update"]:
+                return mock.Mock(returncode=0, stdout="", stderr="")
+            if argv[-1] == "--version":
+                return mock.Mock(returncode=0, stdout="0.42.0\n", stderr="")
+            return mock.Mock(returncode=0, stdout="", stderr="")
+
+        with (
+            mock.patch.object(updater.shutil, "which", _which),
+            mock.patch.object(subprocess, "run", side_effect=_run),
+        ):
+            results = updater._post_apply_update_npm_packages()
+
+        self.assertEqual(results["updated"], ["@google/gemini-cli"])
+        self.assertEqual(results["binary_versions"], {"gemini": "0.42.0"})
+
+    def test_codex_cli_update_success(self) -> None:
+        """Codex in installed_npm gets refreshed and ``binary_versions['codex']``
+        is populated so the core API can clear the stale-cache banner."""
+        self._write_manifest(
+            installed_npm=["@openai/codex"],
+            preexisting_npm=[],
+        )
+
+        def _which(name: str) -> str | None:
+            if name == "npm":
+                return "/usr/bin/npm"
+            if name == "codex":
+                return "/usr/local/bin/codex"
+            return None
+
+        def _run(*args, **_kw):
+            argv = args[0]
+            if argv[1:2] == ["update"]:
+                return mock.Mock(returncode=0, stdout="", stderr="")
+            if argv[-1] == "--version":
+                return mock.Mock(returncode=0, stdout="0.131.0\n", stderr="")
+            return mock.Mock(returncode=0, stdout="", stderr="")
+
+        with (
+            mock.patch.object(updater.shutil, "which", _which),
+            mock.patch.object(subprocess, "run", side_effect=_run),
+        ):
+            results = updater._post_apply_update_npm_packages()
+
+        self.assertEqual(results["updated"], ["@openai/codex"])
+        self.assertEqual(results["binary_versions"], {"codex": "0.131.0"})
+
+    def test_one_failure_does_not_block_others(self) -> None:
+        """If gemini refresh errors out, claude + codex must still be
+        attempted and recorded — failure is per-package, never global."""
+        self._write_manifest(
+            installed_npm=[
+                "@anthropic-ai/claude-code",
+                "@google/gemini-cli",
+                "@openai/codex",
+            ],
+            preexisting_npm=[],
+        )
+
+        def _which(name: str) -> str | None:
+            if name == "npm":
+                return "/usr/bin/npm"
+            if name in ("claude", "gemini", "codex"):
+                return f"/usr/local/bin/{name}"
+            return None
+
+        def _run(*args, **_kw):
+            argv = args[0]
+            pkg = argv[-1]
+            if pkg == "@google/gemini-cli":
+                return mock.Mock(returncode=1, stdout="",
+                                  stderr="ENETDOWN: network unreachable")
+            if argv[1:2] == ["update"]:
+                return mock.Mock(returncode=0, stdout="", stderr="")
+            if argv[-1] == "--version":
+                # Distinct version per binary keeps the assertion specific.
+                bin_name = argv[0].rsplit("/", 1)[-1]
+                versions = {"claude": "2.1.130", "codex": "0.131.0"}
+                return mock.Mock(
+                    returncode=0,
+                    stdout=f"{versions.get(bin_name, '0.0.0')}\n",
+                    stderr="",
+                )
+            return mock.Mock(returncode=0, stdout="", stderr="")
+
+        with (
+            mock.patch.object(updater.shutil, "which", _which),
+            mock.patch.object(subprocess, "run", side_effect=_run),
+        ):
+            results = updater._post_apply_update_npm_packages()
+
+        # Claude + codex succeeded; gemini was recorded as an error.
+        self.assertIn("@anthropic-ai/claude-code", results["updated"])
+        self.assertIn("@openai/codex", results["updated"])
+        self.assertNotIn("@google/gemini-cli", results["updated"])
+        gemini_errors = [
+            e for e in results["errors"] if e["pkg"] == "@google/gemini-cli"
+        ]
+        self.assertEqual(len(gemini_errors), 1)
+        self.assertIn("ENETDOWN", gemini_errors[0]["error"])
+        # Binary version overrides recorded only for successful packages.
+        self.assertEqual(
+            results["binary_versions"],
+            {"claude": "2.1.130", "codex": "0.131.0"},
+        )
+
+    def test_known_extra_refreshed_when_binary_present_but_manifest_empty(self) -> None:
+        """Installs that predate install.sh learning about a provider
+        won't have gemini/codex in the manifest. The known-extra fallback
+        kicks in only when the binary is on PATH — so we refresh existing
+        installs without ever installing a CLI the user didn't ask for."""
+        self._write_manifest(
+            installed_npm=[],
+            preexisting_npm=[],
+        )
+
+        def _which(name: str) -> str | None:
+            if name == "npm":
+                return "/usr/bin/npm"
+            if name == "gemini":
+                return "/usr/local/bin/gemini"  # only gemini is installed
+            return None
+
+        def _run(*args, **_kw):
+            argv = args[0]
+            if argv[1:2] == ["update"]:
+                return mock.Mock(returncode=0, stdout="", stderr="")
+            if argv[-1] == "--version":
+                return mock.Mock(returncode=0, stdout="0.42.0\n", stderr="")
+            return mock.Mock(returncode=0, stdout="", stderr="")
+
+        with (
+            mock.patch.object(updater.shutil, "which", _which),
+            mock.patch.object(subprocess, "run", side_effect=_run),
+        ):
+            results = updater._post_apply_update_npm_packages()
+
+        # Only gemini was picked up — claude/codex were not on PATH so
+        # the loop skipped them (never installs unrequested CLIs).
+        self.assertEqual(results["updated"], ["@google/gemini-cli"])
+        self.assertEqual(results["binary_versions"], {"gemini": "0.42.0"})
+
+    def test_known_extra_skipped_when_binary_missing(self) -> None:
+        """If none of the multi-provider binaries are on PATH and the
+        manifest is empty, the refresh is a silent no-op — no npm calls,
+        no entries in updated[]/errors[]. Preserves the existing
+        ``test_empty_installed_npm_silent_no_op`` contract."""
+        self._write_manifest(installed_npm=[], preexisting_npm=[])
+        # Default which mock returns None for all binaries except npm.
+        with mock.patch.object(subprocess, "run", side_effect=_ok) as run:
+            results = updater._post_apply_update_npm_packages()
+        self.assertEqual(run.call_count, 0)
+        self.assertEqual(results["updated"], [])
+        self.assertEqual(results["errors"], [])
+
+    def test_known_extra_deduped_against_manifest(self) -> None:
+        """A package that's both in installed_npm AND in the known-extra
+        list must only run npm update once — no double-counting in
+        updated[]/binary_versions even if shutil.which finds the binary."""
+        self._write_manifest(
+            installed_npm=["@google/gemini-cli"],
+            preexisting_npm=[],
+        )
+
+        def _which(name: str) -> str | None:
+            if name == "npm":
+                return "/usr/bin/npm"
+            if name == "gemini":
+                return "/usr/local/bin/gemini"
+            return None
+
+        def _run(*args, **_kw):
+            argv = args[0]
+            if argv[1:2] == ["update"]:
+                return mock.Mock(returncode=0, stdout="", stderr="")
+            if argv[-1] == "--version":
+                return mock.Mock(returncode=0, stdout="0.42.0\n", stderr="")
+            return mock.Mock(returncode=0, stdout="", stderr="")
+
+        with (
+            mock.patch.object(updater.shutil, "which", _which),
+            mock.patch.object(subprocess, "run", side_effect=_run),
+        ):
+            results = updater._post_apply_update_npm_packages()
+
+        update_calls = [
+            tuple(c.args[0]) for c in subprocess.run.call_args_list
+            if isinstance(c.args[0], list) and c.args[0][1:2] == ["update"]
+        ] if hasattr(subprocess.run, "call_args_list") else []
+        # subprocess.run was already restored by the with-block; assert
+        # instead through updated[] which would carry duplicates if the
+        # dedup logic broke.
+        self.assertEqual(results["updated"], ["@google/gemini-cli"])
+
+    def test_package_to_binary_map_covers_all_three(self) -> None:
+        """Regression guard: every package in
+        ``_MULTI_PROVIDER_NPM_PACKAGES`` must have a binary mapping in
+        ``_NPM_PACKAGE_TO_BINARY``, otherwise binary_versions stays empty
+        and the core stale-cache override never fires."""
+        for pkg in updater._MULTI_PROVIDER_NPM_PACKAGES:
+            self.assertIn(
+                pkg,
+                updater._NPM_PACKAGE_TO_BINARY,
+                f"missing binary mapping for {pkg}",
+            )
+
+
 class ParseApplyBodyTests(unittest.TestCase):
     """1.6.115: /apply now accepts an optional JSON body. Empty / invalid
     body → empty dict (default behaviour preserved)."""

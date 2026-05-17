@@ -637,7 +637,26 @@ def _record_apply_npm_results(results: dict[str, Any]) -> None:
 # weekly probe.
 _NPM_PACKAGE_TO_BINARY: dict[str, str] = {
     "@anthropic-ai/claude-code": "claude",
+    "@google/gemini-cli": "gemini",
+    "@openai/codex": "codex",
 }
+
+# Multi-provider CLIs sygen-core may call as alternate auth providers.
+# Refreshed on every Apply regardless of manifest contents so installs
+# that predate install.sh learning about them (i.e. pre-subtask-#11)
+# still pick up new versions. The refresh is gated on the binary being
+# present on PATH so we never accidentally *install* a CLI the user
+# didn't ask for — install.sh is the source of truth for what gets
+# placed; sygen-updater only maintains.
+#
+# Why: `npm update -g <pkg>` on a not-installed package is a no-op on
+# modern npm, but we still avoid the call to keep the audit log clean
+# (no spurious entries in `updated[]`/`errors[]`).
+_MULTI_PROVIDER_NPM_PACKAGES: tuple[str, ...] = (
+    "@anthropic-ai/claude-code",
+    "@google/gemini-cli",
+    "@openai/codex",
+)
 
 
 def _read_binary_version(binary: str) -> str | None:
@@ -695,28 +714,41 @@ def _post_apply_update_npm_packages(force_npm_preexisting: bool = False) -> dict
         .isoformat(timespec="seconds")
         .replace("+00:00", "Z"),
     }
-    if not INSTALL_MANIFEST.exists():
-        return results
-    try:
-        manifest = json.loads(INSTALL_MANIFEST.read_text(encoding="utf-8"))
-    except (json.JSONDecodeError, OSError) as exc:
-        logger.warning("post-apply npm: cannot read manifest: %s", exc)
-        return results
-    if not isinstance(manifest, dict):
-        return results
+    installed: list[str] = []
+    preexisting: list[str] = []
+    if INSTALL_MANIFEST.exists():
+        try:
+            manifest = json.loads(INSTALL_MANIFEST.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError) as exc:
+            logger.warning("post-apply npm: cannot read manifest: %s", exc)
+            manifest = None
+        if isinstance(manifest, dict):
+            installed = [p for p in (manifest.get("installed_npm") or []) if isinstance(p, str) and p]
+            raw_pre = manifest.get("preexisting_npm") or []
+            preexisting = [p for p in raw_pre if isinstance(p, str) and p]
+            # Avoid touching the same package twice if it ended up in both
+            # buckets (shouldn't happen, but be defensive — duplicates would
+            # also double-count in updated[]/binary_versions).
+            preexisting = [p for p in preexisting if p not in installed]
 
-    installed = manifest.get("installed_npm") or []
-    installed = [p for p in installed if isinstance(p, str) and p]
-    raw_pre = manifest.get("preexisting_npm") or []
-    preexisting = [p for p in raw_pre if isinstance(p, str) and p]
-    # Avoid touching the same package twice if it ended up in both
-    # buckets (shouldn't happen, but be defensive — duplicates would
-    # also double-count in updated[]/binary_versions).
-    preexisting = [p for p in preexisting if p not in installed]
+    # Multi-provider CLIs we always know about (claude/gemini/codex). Added
+    # as a third "known" bucket so installs that predate install.sh learning
+    # about a provider still get its CLI refreshed. Gated on the binary
+    # being on PATH so we never install something the user didn't ask for.
+    already_listed = set(installed) | set(preexisting)
+    known_extra: list[str] = []
+    for pkg in _MULTI_PROVIDER_NPM_PACKAGES:
+        if pkg in already_listed:
+            continue
+        binary = _NPM_PACKAGE_TO_BINARY.get(pkg)
+        if binary and shutil.which(binary):
+            known_extra.append(pkg)
 
-    pkgs: list[tuple[str, bool]] = [(p, False) for p in installed] + [
-        (p, True) for p in preexisting
-    ]
+    pkgs: list[tuple[str, bool]] = (
+        [(p, False) for p in installed]
+        + [(p, True) for p in preexisting]
+        + [(p, False) for p in known_extra]
+    )
     if not pkgs:
         return results
 

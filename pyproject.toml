@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "sygen-updater"
-version = "1.6.275"
+version = "1.6.276"
 description = "Sygen native updater — polls GitHub Releases, atomically swaps the core venv, restarts the service."
 readme = "README.md"
 requires-python = ">=3.11"
